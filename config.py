@@ -1,3 +1,7 @@
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
 class Config:
     D: int = 16
     L: int = 8
@@ -10,7 +14,7 @@ class Config:
     # --- Stable integration parameters ---
     step_size: float = 1e-3
     T_final: float = 1.0
-    n_steps: int = int(T_final / step_size)
+    n_steps: int = field(init=False)
 
     batch_size: int = 256
     train_epochs: int = 30_000
@@ -29,3 +33,12 @@ class Config:
     force_penalty_start: int = 20_000
     force_penalty_duration: int = 10_000
     force_penalty_scale: float = 0.05
+
+    def __post_init__(self):
+        """Compute n_steps from T_final and step_size."""
+        # For frozen dataclasses, we need to use object.__setattr__ to set fields
+        object.__setattr__(self, "n_steps", int(self.T_final / self.step_size))
+
+
+# Create a default instance
+config = Config()

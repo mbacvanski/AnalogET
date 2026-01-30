@@ -8,33 +8,33 @@ import jax.random as jr
 import optax
 from jax.tree_util import DictKey
 
-from config import Config
+from config import Config, config
 from utils import ModelParams
 
 
-def init_params(key: jax.Array) -> ModelParams:
+def init_params(key: jax.Array, cfg: Config = config) -> ModelParams:
     k1, k2, k3 = jr.split(key, 3)
 
     # token embedding (square to get xi_attn_embed)
     xi_attn_embed_raw = (
-        jr.normal(k1, (Config.vocab_size, Config.D)) * Config.xi_attn_embed_raw_scale
+        jr.normal(k1, (cfg.vocab_size, cfg.D)) * cfg.xi_attn_embed_raw_scale
     )
 
     # Hopfield memory (square to get xi_hopf)
-    xi_hopf_raw = jr.normal(k2, (Config.M, Config.D)) * Config.xi_hopf_raw_scale
+    xi_hopf_raw = jr.normal(k2, (cfg.M, cfg.D)) * cfg.xi_hopf_raw_scale
 
     # attention bias
-    b = jnp.zeros((Config.L,))
+    b = jnp.zeros((cfg.L,))
 
     # Hopfield bias
-    c = jnp.zeros((Config.M,))
+    c = jnp.zeros((cfg.M,))
 
     # visible bias
-    a = jnp.zeros((Config.D,))
+    a = jnp.zeros((cfg.D,))
 
     # decoder weights and bias for parity classification
-    W_dec = jr.normal(k3, (Config.vocab_size, Config.D)) * (1.0 / jnp.sqrt(Config.D))
-    b_dec = jnp.zeros((Config.vocab_size,))
+    W_dec = jr.normal(k3, (cfg.vocab_size, cfg.D)) * (1.0 / jnp.sqrt(cfg.D))
+    b_dec = jnp.zeros((cfg.vocab_size,))
 
     return dict(
         xi_attn_embed_raw=xi_attn_embed_raw,
@@ -57,8 +57,8 @@ def get_xi_hopf(params: ModelParams) -> jax.Array:
     return jnp.square(params["xi_hopf_raw"])
 
 
-def L_attn(h: jax.Array) -> jax.Array:  # (B,L) -> (B,)
-    return (1.0 / Config.beta) * jax.nn.logsumexp(Config.beta * h, axis=-1)
+def L_attn(h: jax.Array, cfg: Config = config) -> jax.Array:  # (B,L) -> (B,)
+    return (1.0 / cfg.beta) * jax.nn.logsumexp(cfg.beta * h, axis=-1)
 
 
 def L_hopf(h: jax.Array) -> jax.Array:  # (B,M) -> (B,)
@@ -74,6 +74,7 @@ def energy_per_sample(
     f_attn: jax.Array,
     f_hopf: jax.Array,
     ctx_bits_row: jax.Array,
+    cfg: Config = config,
 ) -> jax.Array:
     # Xi: (L, D) rows selected by the tokens in this sequence (positive-used)
     xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
@@ -91,7 +92,7 @@ def energy_per_sample(
     hopf_bias = jnp.dot(f_hopf, h_hopf - params["c"])  # scalar
 
     # Total mixed-coordinate energy
-    return vis_term - coupling + attn_bias + hopf_bias - L_attn(h_attn) - L_hopf(h_hopf)
+    return vis_term - coupling + attn_bias + hopf_bias - L_attn(h_attn, cfg) - L_hopf(h_hopf)
 
 
 def energy_per_batch(
@@ -102,6 +103,7 @@ def energy_per_batch(
     F_attn: jax.Array,
     F_hopf: jax.Array,
     ctx_bits: jax.Array,
+    cfg: Config = config,
 ) -> jax.Array:
     """
     V:      (B, D)
@@ -111,8 +113,8 @@ def energy_per_batch(
     A:      (B, M)   -- activations (ReLU of H_hopf), treated as independent arg
     ctx_bits: (B, L)
     """
-    E_b = jax.vmap(energy_per_sample, in_axes=(None, 0, 0, 0, 0, 0, 0))(
-        params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits
+    E_b = jax.vmap(energy_per_sample, in_axes=(None, 0, 0, 0, 0, 0, 0, None))(
+        params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits, cfg
     )
     return jnp.sum(E_b)
 
@@ -135,9 +137,9 @@ def _init_hidden(
     return H_attn0, H_hopf0
 
 
-@functools.partial(jax.jit, donate_argnums=(1,))  # donate V0 buffer
+@functools.partial(jax.jit, donate_argnums=(1,), static_argnames=("cfg",))  # donate V0 buffer
 def infer_forward_euler_with_force(
-    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array
+    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array, cfg: Config = config
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Returns:
@@ -146,8 +148,8 @@ def infer_forward_euler_with_force(
     """
     xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
     batch_xi_attn = xi_attn_embed[ctx_bits]  # (B, L, D)
-    step_v = Config.step_size / Config.tau_v
-    step_h = Config.step_size / Config.tau_h
+    step_v = cfg.step_size / cfg.tau_v
+    step_h = cfg.step_size / cfg.tau_h
 
     # Initial pre-activations
     H_attn0 = jnp.einsum("bld,bd->bl", batch_xi_attn, V0) + params["b"]
@@ -162,7 +164,7 @@ def infer_forward_euler_with_force(
             att_bias = jnp.dot(f_attn, h_attn - params["b"])
             hopf_bias = jnp.dot(f_hopf, h_hopf - params["c"])
             return (
-                vis - coupling + att_bias + hopf_bias - L_attn(h_attn) - L_hopf(h_hopf)
+                vis - coupling + att_bias + hopf_bias - L_attn(h_attn, cfg) - L_hopf(h_hopf)
             )
 
         Eb = jax.vmap(_sample_energy, in_axes=(0, 0, 0, 0, 0, 0))(
@@ -173,7 +175,7 @@ def infer_forward_euler_with_force(
     grad_E = jax.grad(batch_energy, argnums=(1, 4, 5))  # grads wrt (V, F_attn, F_hopf)
 
     def grads_activation(V, H_attn, H_hopf):
-        F_attn = jax.nn.softmax(Config.beta * H_attn, axis=-1)
+        F_attn = jax.nn.softmax(cfg.beta * H_attn, axis=-1)
         F_hopf = jnp.maximum(H_hopf, 0.0)
         dE_dV, dE_dF_attn, dE_dF_hopf = grad_E(
             params, V, H_attn, H_hopf, F_attn, F_hopf
@@ -189,18 +191,18 @@ def infer_forward_euler_with_force(
         return (V, H_attn, H_hopf)
 
     V_T, H_attn_T, H_hopf_T = jax.lax.fori_loop(
-        0, Config.n_steps, body, (V0, H_attn0, H_hopf0)
+        0, cfg.n_steps, body, (V0, H_attn0, H_hopf0)
     )
 
     # Force at terminal state (no extra allocations beyond one grad eval)
     dE_dV_T, _, _ = grads_activation(V_T, H_attn_T, H_hopf_T)
-    F_T = -(1.0 / Config.tau_v) * dE_dV_T
+    F_T = -(1.0 / cfg.tau_v) * dE_dV_T
     return V_T, F_T
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("cfg",))
 def infer_forward_euler(
-    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array
+    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array, cfg: Config = config
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Returns:
@@ -222,7 +224,7 @@ def infer_forward_euler(
             att_bias = jnp.dot(f_attn, h_attn - params["b"])
             hopf_bias = jnp.dot(f_hopf, h_hopf - params["c"])
             return (
-                vis - coupling + att_bias + hopf_bias - L_attn(h_attn) - L_hopf(h_hopf)
+                vis - coupling + att_bias + hopf_bias - L_attn(h_attn, cfg) - L_hopf(h_hopf)
             )
 
         Eb = jax.vmap(energy_per_sample_w_xi, in_axes=(0, 0, 0, 0, 0, 0))(
@@ -235,7 +237,7 @@ def infer_forward_euler(
     )  # grads w.r.t. (V, F_attn, F_hopf)
 
     def grads_activation(V, H_attn, H_hopf):
-        F_attn = jax.nn.softmax(Config.beta * H_attn, axis=-1)
+        F_attn = jax.nn.softmax(cfg.beta * H_attn, axis=-1)
         F_hopf = jnp.maximum(H_hopf, 0.0)
         (
             dE_dV,
@@ -247,19 +249,19 @@ def infer_forward_euler(
     def step(carry, _):
         V, H_attn, H_hopf = carry
         dE_dV, dE_dF_attn, dE_dF_hopf, _, _ = grads_activation(V, H_attn, H_hopf)
-        Vn = V - (Config.step_size / Config.tau_v) * dE_dV
-        H_attn_n = H_attn - (Config.step_size / Config.tau_h) * dE_dF_attn
-        H_hopf_n = H_hopf - (Config.step_size / Config.tau_h) * dE_dF_hopf
+        Vn = V - (cfg.step_size / cfg.tau_v) * dE_dV
+        H_attn_n = H_attn - (cfg.step_size / cfg.tau_h) * dE_dF_attn
+        H_hopf_n = H_hopf - (cfg.step_size / cfg.tau_h) * dE_dF_hopf
         return (Vn, H_attn_n, H_hopf_n), Vn
 
     (V_T, _, _), V_traj = jax.lax.scan(
-        step, (V0, H_attn0, H_hopf0), xs=None, length=Config.n_steps
+        step, (V0, H_attn0, H_hopf0), xs=None, length=cfg.n_steps
     )
     return V_T, V_traj
 
 
 def run_model_inference_steps(
-    ctx_bits: jax.Array, params: ModelParams, V0: jax.Array | None = None
+    ctx_bits: jax.Array, params: ModelParams, V0: jax.Array | None = None, cfg: Config = config
 ) -> Tuple[Tuple[jax.Array, jax.Array, jax.Array], Dict[str, jax.Array]]:
     """
     Run forward Euler inference and return trajectories of
@@ -272,7 +274,7 @@ def run_model_inference_steps(
     """
     B = ctx_bits.shape[0]
     if V0 is None:
-        V0 = jnp.zeros((B, Config.D), dtype=jnp.float32)
+        V0 = jnp.zeros((B, cfg.D), dtype=jnp.float32)
 
     H_attn0, H_hopf0 = _init_hidden(params, V0, ctx_bits)
 
@@ -280,33 +282,33 @@ def run_model_inference_steps(
         V, H_attn, H_hopf = carry
 
         # Activations at current state (used only for gradients)
-        F_attn = jax.nn.softmax(Config.beta * H_attn, axis=-1)  # (B, L)
+        F_attn = jax.nn.softmax(cfg.beta * H_attn, axis=-1)  # (B, L)
         F_hopf = jnp.maximum(H_hopf, 0.0)  # (B, M)
 
         # Gradients wrt activation-coordinates
         dE_dV = jax.grad(energy_per_batch, argnums=1)(
-            params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits
+            params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits, cfg
         )
         dE_dF_attn = jax.grad(energy_per_batch, argnums=4)(
-            params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits
+            params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits, cfg
         )
         dE_dF_hopf = jax.grad(energy_per_batch, argnums=5)(
-            params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits
+            params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits, cfg
         )
 
         # Forward Euler updates
-        Vn = V - (Config.step_size / Config.tau_v) * dE_dV
-        H_attn_n = H_attn - (Config.step_size / Config.tau_h) * dE_dF_attn
-        H_hopf_n = H_hopf - (Config.step_size / Config.tau_h) * dE_dF_hopf
+        Vn = V - (cfg.step_size / cfg.tau_v) * dE_dV
+        H_attn_n = H_attn - (cfg.step_size / cfg.tau_h) * dE_dF_attn
+        H_hopf_n = H_hopf - (cfg.step_size / cfg.tau_h) * dE_dF_hopf
 
         # Log post-update quantities (time t+Δt)
-        F_attn_n = jax.nn.softmax(Config.beta * H_attn_n, axis=-1)  # (B, L)
+        F_attn_n = jax.nn.softmax(cfg.beta * H_attn_n, axis=-1)  # (B, L)
         H_hopf_n = jnp.maximum(H_hopf_n, 0.0)  # (B, M)
         logits_n = logits_from_v(params, Vn)  # (B, vocab_size)
 
         # Per-sample mixed energy at post-update state
-        E_b = jax.vmap(energy_per_sample, in_axes=(None, 0, 0, 0, 0, 0, 0))(
-            params, Vn, H_attn_n, H_hopf_n, F_attn_n, H_hopf_n, ctx_bits
+        E_b = jax.vmap(energy_per_sample, in_axes=(None, 0, 0, 0, 0, 0, 0, None))(
+            params, Vn, H_attn_n, H_hopf_n, F_attn_n, H_hopf_n, ctx_bits, cfg
         )  # (B,)
 
         return (Vn, H_attn_n, H_hopf_n), (Vn, H_attn_n, H_hopf_n, logits_n, E_b)
@@ -318,7 +320,7 @@ def run_model_inference_steps(
         H_hopf_traj,
         logits_traj,
         E_traj,
-    ) = jax.lax.scan(step, (V0, H_attn0, H_hopf0), xs=None, length=Config.n_steps)
+    ) = jax.lax.scan(step, (V0, H_attn0, H_hopf0), xs=None, length=cfg.n_steps)
 
     traj = dict(
         V=V_traj,  # (T, B, D)
@@ -338,39 +340,39 @@ def force_penalty(F_T: jax.Array) -> jax.Array:
     return jnp.mean(jnp.sum(F_T * F_T, axis=1))  # MSE of force
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("cfg",))
 def loss_fn(
-    params: ModelParams, ctx_bits: jax.Array, labels: jax.Array, force_weight: jax.Array
+    params: ModelParams, ctx_bits: jax.Array, labels: jax.Array, force_weight: jax.Array, cfg: Config = config
 ):
     """
     force_weight: scalar multiplier for the force penalty term.
     """
     B = ctx_bits.shape[0]
-    V0 = jnp.zeros((B, Config.D))  # visible init
-    V_T, F_T = infer_forward_euler_with_force(params, V0, ctx_bits)
+    V0 = jnp.zeros((B, cfg.D))  # visible init
+    V_T, F_T = infer_forward_euler_with_force(params, V0, ctx_bits, cfg)
     logits_T = logits_from_v(params, V_T)
     ce = optax.softmax_cross_entropy_with_integer_labels(logits_T, labels).mean()
     return ce + force_weight * force_penalty(F_T)
 
 
-@jax.jit
-def evaluate(params: ModelParams, valid_X: jax.Array, valid_y: jax.Array) -> jax.Array:
+@functools.partial(jax.jit, static_argnames=("cfg",))
+def evaluate(params: ModelParams, valid_X: jax.Array, valid_y: jax.Array, cfg: Config = config) -> jax.Array:
     V_T, _ = infer_forward_euler_with_force(
-        params, jnp.zeros((valid_y.shape[0], Config.D), jnp.float32), valid_X
+        params, jnp.zeros((valid_y.shape[0], cfg.D), jnp.float32), valid_X, cfg
     )
     preds = jnp.argmax(logits_from_v(params, V_T), axis=1)
     return jnp.mean((preds == valid_y).astype(jnp.float32))
 
 
-def force_penalty_weight(epoch: int) -> float:
+def force_penalty_weight(epoch: int, cfg: Config = config) -> float:
     """
     Around 17k epochs the model starts to get 100% accuracy on the validation set,
     at which point start ramping up the force penalty.
     Applying force penalty too early causes the model to never reach good accuracies.
     """
 
-    start = Config.force_penalty_start
-    duration = Config.force_penalty_duration
+    start = cfg.force_penalty_start
+    duration = cfg.force_penalty_duration
     end = start + duration
 
     if epoch < start:
@@ -382,7 +384,7 @@ def force_penalty_weight(epoch: int) -> float:
     t = (epoch - start) / duration
 
     # cosine ramp: 0 → 1
-    return Config.force_penalty_scale * (1.0 - math.cos(math.pi * t))
+    return cfg.force_penalty_scale * (1.0 - math.cos(math.pi * t))
 
 
 # Parameter partition

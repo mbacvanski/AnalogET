@@ -2,4 +2,4 @@ data
 __pycache__
 .DS_Store
 wandb
-slurm/logs/
+slurm/logs/configs/config_*.json

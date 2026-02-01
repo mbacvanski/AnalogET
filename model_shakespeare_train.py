@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 import json
 import os
 from typing import List
@@ -42,7 +43,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sample_mode",
         action="store_true",
-        help="Use only 100 batches of data for quick hyperparameter search",
+        help="Use only 1000 batches of data for quick hyperparameter search",
     )
     args = parser.parse_args()
     
@@ -64,11 +65,11 @@ if __name__ == "__main__":
     vocab_size = len(char_to_idx)
     print(f"Using vocab_size={vocab_size}")
     
-    # Apply sample mode if requested (limit to 100 batches worth of data)
+    # Apply sample mode if requested (limit to 1000 batches worth of data)
     if args.sample_mode:
-        max_samples = 100 * 256  # 100 batches * batch_size
+        max_samples = 1000 * 256  # 1000 batches * batch_size
         if len(train_X) > max_samples:
-            print(f"Sample mode: Using {max_samples} training samples (100 batches)")
+            print(f"Sample mode: Using {max_samples} training samples (1000 batches)")
             train_X = train_X[:max_samples]
             train_y = train_y[:max_samples]
         if len(valid_X) > max_samples:
@@ -92,6 +93,28 @@ if __name__ == "__main__":
             vocab_size=vocab_size,
         )
 
+    # Create timestamped output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"data/shakespeare/{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Output directory: {output_dir}")
+    
+    # Save config to output directory for reproducibility
+    config_save_dict = {
+        k: getattr(shakespeare_config, k) 
+        for k in dir(shakespeare_config)
+        if not k.startswith("_") and not callable(getattr(shakespeare_config, k))
+    }
+    config_save_dict['sample_mode'] = args.sample_mode
+    config_save_dict['temperature'] = args.temperature
+    config_save_dict['gen_chars'] = args.gen_chars
+    if args.config:
+        config_save_dict['config_file'] = args.config
+    
+    with open(f"{output_dir}/run_config.json", "w") as f:
+        json.dump(config_save_dict, f, indent=2)
+    print(f"Run configuration saved to {output_dir}/run_config.json")
+    
     # ---- W&B init ----
     # Try to serialize Config cleanly (works for dataclass / simple objects)
     try:
@@ -291,17 +314,17 @@ if __name__ == "__main__":
             )
             # --------------------------------
 
-            save_params(params, "data/shakespeare/model_shakespeare.npz")
+            save_params(params, f"{output_dir}/model_shakespeare.npz")
             if acc >= 0.5:
-                save_params(params, "data/shakespeare/model_shakespeare_best.npz")
+                save_params(params, f"{output_dir}/model_shakespeare_best.npz")
 
-    save_metrics({"step": losses_steps, "loss": losses_all}, "data/shakespeare/losses_shakespeare.json")
-    save_metrics({"step": accs_steps, "accuracy": accs_all}, "data/shakespeare/accs_shakespeare.json")
-    save_metrics({"step": perplexities_steps, "perplexity": perplexities_all}, "data/shakespeare/perplexities_shakespeare.json")
-    save_metrics({"epoch": generated_texts_epochs, "text": generated_texts_all}, "data/shakespeare/generated_texts_shakespeare.json")
+    save_metrics({"step": losses_steps, "loss": losses_all}, f"{output_dir}/losses_shakespeare.json")
+    save_metrics({"step": accs_steps, "accuracy": accs_all}, f"{output_dir}/accs_shakespeare.json")
+    save_metrics({"step": perplexities_steps, "perplexity": perplexities_all}, f"{output_dir}/perplexities_shakespeare.json")
+    save_metrics({"epoch": generated_texts_epochs, "text": generated_texts_all}, f"{output_dir}/generated_texts_shakespeare.json")
 
-    save_params(params, "data/shakespeare/model_shakespeare.npz")
-    print("Training complete. Model parameters saved to 'data/shakespeare/model_shakespeare.npz'.")
+    save_params(params, f"{output_dir}/model_shakespeare.npz")
+    print(f"Training complete. Model parameters saved to '{output_dir}/model_shakespeare.npz'.")
     
     # Create plots
     print("Creating training plots...")
@@ -309,7 +332,7 @@ if __name__ == "__main__":
         losses_steps, losses_all,
         accs_steps, accs_all,
         perplexities_steps, perplexities_all,
-        output_path="data/shakespeare/training_metrics_shakespeare.png"
+        output_path=f"{output_dir}/training_metrics_shakespeare.png"
     )
     print(f"Plots saved to {plot_path}")
     

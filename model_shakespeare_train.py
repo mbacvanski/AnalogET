@@ -39,6 +39,11 @@ if __name__ == "__main__":
         default=32,
         help="Number of characters to generate at each epoch (default: 32)",
     )
+    parser.add_argument(
+        "--sample_mode",
+        action="store_true",
+        help="Use only 100 batches of data for quick hyperparameter search",
+    )
     args = parser.parse_args()
     
     # Load or prepare Shakespeare dataset
@@ -58,6 +63,18 @@ if __name__ == "__main__":
 
     vocab_size = len(char_to_idx)
     print(f"Using vocab_size={vocab_size}")
+    
+    # Apply sample mode if requested (limit to 100 batches worth of data)
+    if args.sample_mode:
+        max_samples = 100 * 256  # 100 batches * batch_size
+        if len(train_X) > max_samples:
+            print(f"Sample mode: Using {max_samples} training samples (100 batches)")
+            train_X = train_X[:max_samples]
+            train_y = train_y[:max_samples]
+        if len(valid_X) > max_samples:
+            print(f"Sample mode: Using {max_samples} validation samples")
+            valid_X = valid_X[:max_samples]
+            valid_y = valid_y[:max_samples]
 
     # Initialize config from JSON file if provided, otherwise use defaults
     if args.config:
@@ -274,17 +291,17 @@ if __name__ == "__main__":
             )
             # --------------------------------
 
-            save_params(params, "data/model_shakespeare.npz")
+            save_params(params, "data/shakespeare/model_shakespeare.npz")
             if acc >= 0.5:
-                save_params(params, "data/model_shakespeare_best.npz")
+                save_params(params, "data/shakespeare/model_shakespeare_best.npz")
 
-    save_metrics({"step": losses_steps, "loss": losses_all}, "data/losses_shakespeare.json")
-    save_metrics({"step": accs_steps, "accuracy": accs_all}, "data/accs_shakespeare.json")
-    save_metrics({"step": perplexities_steps, "perplexity": perplexities_all}, "data/perplexities_shakespeare.json")
-    save_metrics({"epoch": generated_texts_epochs, "text": generated_texts_all}, "data/generated_texts_shakespeare.json")
+    save_metrics({"step": losses_steps, "loss": losses_all}, "data/shakespeare/losses_shakespeare.json")
+    save_metrics({"step": accs_steps, "accuracy": accs_all}, "data/shakespeare/accs_shakespeare.json")
+    save_metrics({"step": perplexities_steps, "perplexity": perplexities_all}, "data/shakespeare/perplexities_shakespeare.json")
+    save_metrics({"epoch": generated_texts_epochs, "text": generated_texts_all}, "data/shakespeare/generated_texts_shakespeare.json")
 
-    save_params(params, "data/model_shakespeare.npz")
-    print("Training complete. Model parameters saved to 'data/model_shakespeare.npz'.")
+    save_params(params, "data/shakespeare/model_shakespeare.npz")
+    print("Training complete. Model parameters saved to 'data/shakespeare/model_shakespeare.npz'.")
     
     # Create plots
     print("Creating training plots...")
@@ -292,7 +309,7 @@ if __name__ == "__main__":
         losses_steps, losses_all,
         accs_steps, accs_all,
         perplexities_steps, perplexities_all,
-        output_path="data/training_metrics_shakespeare.png"
+        output_path="data/shakespeare/training_metrics_shakespeare.png"
     )
     print(f"Plots saved to {plot_path}")
     

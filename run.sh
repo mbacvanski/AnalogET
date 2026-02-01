@@ -1,14 +1,29 @@
 #!/bin/bash
-# Example script to run Shakespeare model training with custom configuration
+# Script to run Shakespeare model training with all configurations in configs/ folder
 
-# Example 1: Run with default configuration
-# python model_shakespeare_train.py
+# Set temperature and generation characters
+TEMPERATURE=0.1
+GEN_CHARS=32
 
-# Example 2: Run with custom JSON config
-# python model_shakespeare_train.py --config shakespeare_config.json
+# Iterate through all config files in the configs directory
+for config_file in configs/config_*.json; do
+    if [ -f "$config_file" ]; then
+        echo "=========================================="
+        echo "Running training with config: $config_file"
+        echo "=========================================="
+        
+        python model_shakespeare_train.py \
+            --config "$config_file" \
+            --temperature $TEMPERATURE \
+            --gen_chars $GEN_CHARS \
+            --sample_mode
+        
+        echo ""
+        echo "Completed: $config_file"
+        echo ""
+    fi
+done
 
-# Example 3: Run with custom config and text generation settings
-python model_shakespeare_train.py \
-  --config shakespeare_config.json \
-  --temperature 0.1 \
-  --gen_chars 32
+echo "=========================================="
+echo "All configurations completed!"
+echo "=========================================="

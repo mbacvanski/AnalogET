@@ -3,12 +3,11 @@ name = "analog-denseam"
 version = "0.1.0"
 description = "Analogic DenseAM"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11, <3.14"
 dependencies = [
     "diffrax==0.7.0",
     "jax==0.5.0",
-    "jax-metal==0.1.1",
-    "jupyter==1.1.1",
+    "jax-metal==0.1.1; sys_platform == 'darwin'",
     "matplotlib==3.10.1",
     "optax==0.2.4",
     "tqdm==4.67.1",
@@ -21,6 +20,7 @@ dev = [
     "flake8>=7.3.0",
     "mypy>=1.18.2",
     "pytest>=8.4.2",
+    "jupyter==1.1.1",
 ]
 
 [tool.flake8]

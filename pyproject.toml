@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib==3.10.1",
     "optax==0.2.4",
     "tqdm==4.67.1",
+    "wandb>=0.24.1",
 ]
 
 [dependency-groups]

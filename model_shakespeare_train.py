@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 from typing import List
 
@@ -14,9 +16,31 @@ import wandb
 from config import Config
 from data import load_shakespeare_dataset, prepare_shakespeare_dataset
 from model import evaluate, force_penalty_weight, init_params, label_tree, loss_fn
-from utils import save_metrics, save_params
+from utils import calculate_perplexity, generate_text, plot_training_metrics, save_metrics, save_params
 
 if __name__ == "__main__":
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Train Shakespeare character prediction model")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON config file to initialize shakespeare_config",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Temperature for text generation sampling (default: 0.8)",
+    )
+    parser.add_argument(
+        "--gen_chars",
+        type=int,
+        default=32,
+        help="Number of characters to generate at each epoch (default: 32)",
+    )
+    args = parser.parse_args()
+    
     # Load or prepare Shakespeare dataset
     filename_prefix = "shakespeare_data"
     dataset_exists = os.path.exists(f"data/{filename_prefix}_train_X.txt")
@@ -35,10 +59,21 @@ if __name__ == "__main__":
     vocab_size = len(char_to_idx)
     print(f"Using vocab_size={vocab_size}")
 
-    shakespeare_config = Config(
-        L=16,
-        vocab_size=vocab_size,
-    )
+    # Initialize config from JSON file if provided, otherwise use defaults
+    if args.config:
+        print(f"Loading config from {args.config}")
+        with open(args.config, "r") as f:
+            config_dict = json.load(f)
+        shakespeare_config = Config(
+            L=config_dict.get("L", 16),
+            vocab_size=vocab_size,
+            **{k: v for k, v in config_dict.items() if k not in ["L", "vocab_size"]}
+        )
+    else:
+        shakespeare_config = Config(
+            L=16,
+            vocab_size=vocab_size,
+        )
 
     # ---- W&B init ----
     # Try to serialize Config cleanly (works for dataclass / simple objects)
@@ -119,8 +154,15 @@ if __name__ == "__main__":
     losses_steps: List[int] = []
     accs_all = []
     accs_steps: List[int] = []
+    perplexities_all = []
+    perplexities_steps: List[int] = []
+    generated_texts_all = []
+    generated_texts_epochs: List[int] = []
 
     global_step = 0
+    
+    # Prepare a seed context for text generation (use first sequence from validation)
+    seed_context = valid_X[0]
 
     for epoch in range(shakespeare_config.train_epochs):
         t_start = time.time()
@@ -186,33 +228,75 @@ if __name__ == "__main__":
             acc = evaluate(params, valid_X, valid_y, shakespeare_config)
             accs_all.append(float(acc))
             accs_steps.append((epoch + 1) * num_batches - 1)
+            
+            # Calculate perplexity
+            perplexity = calculate_perplexity(params, valid_X, valid_y, shakespeare_config)
+            perplexities_all.append(float(perplexity))
+            perplexities_steps.append((epoch + 1) * num_batches - 1)
+            
+            # Generate text
+            key, gen_key = jr.split(key)
+            generated_text = generate_text(
+                params,
+                seed_context,
+                idx_to_char,
+                shakespeare_config,
+                num_chars=args.gen_chars,
+                temperature=args.temperature,
+                key=gen_key,
+            )
+            generated_texts_all.append(generated_text)
+            generated_texts_epochs.append(epoch)
+            
+            # Show seed context for reference
+            seed_text = "".join([idx_to_char[int(idx)] for idx in seed_context])
 
             print(
                 f"epoch {epoch:5d} | "
                 f"force_w {float(lam_force):5.3f} | "
                 f"train loss {mean_train_loss:8.4f} | "
                 f"valid acc {float(acc):6.4f} | "
-                f"{epoch_time:3.3f}s / epoch | "
+                f"perplexity {perplexity:8.4f} | "
+                f"{epoch_time:3.3f}s / epoch"
             )
+            print(f"  Seed: '{seed_text}'")
+            print(f"  Generated: '{generated_text}'")
 
             # ---- W&B eval logging ----
             wandb.log(
                 {
                     "valid/accuracy": float(acc),
+                    "valid/perplexity": float(perplexity),
                     "valid/eval_epoch": epoch,
+                    "generated_text": wandb.Html(f"<pre>Seed: {seed_text}\nGenerated: {generated_text}</pre>"),
                 },
                 step=global_step - 1,
             )
             # --------------------------------
 
             save_params(params, "data/model_shakespeare.npz")
-            if acc >= 0.99:
+            if acc >= 0.5:
                 save_params(params, "data/model_shakespeare_best.npz")
 
     save_metrics({"step": losses_steps, "loss": losses_all}, "data/losses_shakespeare.json")
     save_metrics({"step": accs_steps, "accuracy": accs_all}, "data/accs_shakespeare.json")
+    save_metrics({"step": perplexities_steps, "perplexity": perplexities_all}, "data/perplexities_shakespeare.json")
+    save_metrics({"epoch": generated_texts_epochs, "text": generated_texts_all}, "data/generated_texts_shakespeare.json")
 
     save_params(params, "data/model_shakespeare.npz")
     print("Training complete. Model parameters saved to 'data/model_shakespeare.npz'.")
+    
+    # Create plots
+    print("Creating training plots...")
+    plot_path = plot_training_metrics(
+        losses_steps, losses_all,
+        accs_steps, accs_all,
+        perplexities_steps, perplexities_all,
+        output_path="data/training_metrics_shakespeare.png"
+    )
+    print(f"Plots saved to {plot_path}")
+    
+    # Log final plot to W&B
+    wandb.log({"training_summary": wandb.Image(plot_path)})
 
     wandb.finish()

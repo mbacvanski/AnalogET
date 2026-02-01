@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=shakespeare-sweep
 #SBATCH --partition=mit_normal
-#SBATCH --array=1-10
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=04:00:00
@@ -17,6 +16,17 @@ set -euo pipefail
 PROJECT_DIR="$HOME/analog-denseam"
 cd "$PROJECT_DIR"
 
+# ---------- Auto-submit with correct --array if not already in a SLURM job ----------
+if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    NUM_CONFIGS=$(ls configs/config_*.json 2>/dev/null | wc -l)
+    if [ "$NUM_CONFIGS" -eq 0 ]; then
+        echo "ERROR: No config files found in configs/" >&2
+        exit 1
+    fi
+    echo "Found $NUM_CONFIGS configs, submitting array job 1-$NUM_CONFIGS ..."
+    exec sbatch --array="1-$NUM_CONFIGS" "$0"
+fi
+
 export JAX_PLATFORMS=cpu
 
 # Activate the venv directly — do NOT use `uv run` on compute nodes.
@@ -25,7 +35,7 @@ export JAX_PLATFORMS=cpu
 source "$PROJECT_DIR/.venv/bin/activate"
 
 # ---------- Map array index to config file ----------
-CONFIG_ID=$(printf "%02d" "$SLURM_ARRAY_TASK_ID")
+CONFIG_ID=$(printf "%03d" "$SLURM_ARRAY_TASK_ID")
 CONFIG_FILE="configs/config_${CONFIG_ID}.json"
 
 if [ ! -f "$CONFIG_FILE" ]; then

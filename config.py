@@ -24,8 +24,11 @@ class Config:
     tau_v: float = 1e-1
     tau_h: float = 1e-2
 
+    # Optimizer configuration
+    use_multi_transform: bool = True
     lr_init_value: float = 0.0
     lr_peak_value: float = 3e-3
+    learning_rate: float = 1e-3
     max_norm: float = 1.0
     slow_weight_decay: float = 5e-5
     fast_weight_decay: float = 0.0

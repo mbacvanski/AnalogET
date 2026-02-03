@@ -153,29 +153,39 @@ if __name__ == "__main__":
         )
 
 
-    # ---- create schedule objects so we can log LR ----
-    lr_schedule_fast = lr_sched(shakespeare_config.lr_peak_value)
-    lr_schedule_slow = lr_sched(shakespeare_config.lr_peak_value)
+    # ---- create optimizer based on config ----
+    if shakespeare_config.use_multi_transform:
+        # Multi-transform optimizer with fast/slow parameters
+        lr_schedule_fast = lr_sched(shakespeare_config.lr_peak_value)
+        lr_schedule_slow = lr_sched(shakespeare_config.lr_peak_value)
+        
+        tx_fast = optax.chain(
+            optax.clip_by_global_norm(shakespeare_config.max_norm),
+            optax.adamw(
+                learning_rate=lr_schedule_fast,
+                weight_decay=shakespeare_config.fast_weight_decay,
+            ),
+        )
+        tx_slow = optax.chain(
+            optax.clip_by_global_norm(shakespeare_config.max_norm),
+            optax.adamw(
+                learning_rate=lr_schedule_slow,
+                weight_decay=shakespeare_config.slow_weight_decay,
+            ),
+        )
+        
+        optimizer = optax.multi_transform(
+            {"fast": tx_fast, "slow": tx_slow}, label_tree(params)
+        )
+    else:
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(shakespeare_config.max_norm),
+            optax.adamw(
+                learning_rate=shakespeare_config.learning_rate,
+            ),
+        )
     # -------------------------------------------------------
-
-    tx_fast = optax.chain(
-        optax.clip_by_global_norm(shakespeare_config.max_norm),
-        optax.adamw(
-            learning_rate=lr_schedule_fast,  # <-- CHANGE: use object
-            weight_decay=shakespeare_config.fast_weight_decay,
-        ),
-    )
-    tx_slow = optax.chain(
-        optax.clip_by_global_norm(shakespeare_config.max_norm),
-        optax.adamw(
-            learning_rate=lr_schedule_slow,  # <-- CHANGE: use object
-            weight_decay=shakespeare_config.slow_weight_decay,
-        ),
-    )
-
-    optimizer = optax.multi_transform(
-        {"fast": tx_fast, "slow": tx_slow}, label_tree(params)
-    )
+    
     opt_state = optimizer.init(params)
 
 
@@ -235,17 +245,21 @@ if __name__ == "__main__":
 
             # ---- W&B per-step logging ----
             # If logging every step is too chatty, gate with: if global_step % 10 == 0:
-            wandb.log(
-                {
-                    "train/loss": float(loss),
-                    "train/force_w": float(lam_force),
-                    "train/grad_norm": float(grad_norm),
-                    "train/lr_fast": float(lr_schedule_fast(global_step)),
-                    "train/lr_slow": float(lr_schedule_slow(global_step)),
-                    "epoch": epoch,
-                },
-                step=global_step,
-            )
+            log_dict = {
+                "train/loss": float(loss),
+                "train/force_w": float(lam_force),
+                "train/grad_norm": float(grad_norm),
+                "epoch": epoch,
+            }
+            
+            # Add learning rate logs based on optimizer type
+            if shakespeare_config.use_multi_transform:
+                log_dict["train/lr_fast"] = float(lr_schedule_fast(global_step))
+                log_dict["train/lr_slow"] = float(lr_schedule_slow(global_step))
+            else:
+                log_dict["train/lr"] = float(shakespeare_config.learning_rate)
+            
+            wandb.log(log_dict, step=global_step)
             # ------------------------------------
 
             global_step += 1

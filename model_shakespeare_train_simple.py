@@ -17,7 +17,18 @@ import wandb
 
 from config import Config
 from data import load_shakespeare_dataset, prepare_shakespeare_dataset
-from model import evaluate, force_penalty_weight, init_params, label_tree, loss_fn
+from model import (
+    L_attn,
+    L_hopf,
+    evaluate,
+    force_penalty_weight,
+    get_xi_attn_embed,
+    get_xi_hopf,
+    get_xi_pos,
+    init_params,
+    label_tree,
+    logits_from_v,
+)
 from utils import calculate_perplexity, generate_text, plot_training_metrics, save_metrics, save_params
 
 if __name__ == "__main__":
@@ -147,38 +158,22 @@ if __name__ == "__main__":
 
     num_train = train_X.shape[0]
     num_batches = (num_train + shakespeare_config.batch_size - 1) // shakespeare_config.batch_size
-    total_steps = shakespeare_config.max_steps
+    # total_steps = shakespeare_config.max_steps  # schedules removed; keep constant LR
 
-
-    def lr_sched(
-            peak: float, warmup_steps: int = 0
-    ) -> optax.Schedule:
-        """warm up to peak, then decay to peak * end_factor"""
-        return optax.warmup_cosine_decay_schedule(
-            init_value=shakespeare_config.lr_init_value,
-            peak_value=peak,
-            warmup_steps=warmup_steps,
-            decay_steps=max(1, total_steps - warmup_steps),
-            end_value=peak * shakespeare_config.lr_end_factor,
-        )
-
-
-    # ---- create schedule objects so we can log LR ----
-    lr_schedule_fast = lr_sched(shakespeare_config.lr_peak_value)
-    lr_schedule_slow = lr_sched(shakespeare_config.lr_peak_value)
-    # -------------------------------------------------------
+    lr_fast = float(shakespeare_config.lr_peak_value)
+    lr_slow = float(shakespeare_config.lr_peak_value)
 
     tx_fast = optax.chain(
         optax.clip_by_global_norm(shakespeare_config.max_norm),
         optax.adamw(
-            learning_rate=lr_schedule_fast,  # <-- CHANGE: use object
+            learning_rate=lr_fast,
             weight_decay=shakespeare_config.fast_weight_decay,
         ),
     )
     tx_slow = optax.chain(
         optax.clip_by_global_norm(shakespeare_config.max_norm),
         optax.adamw(
-            learning_rate=lr_schedule_slow,  # <-- CHANGE: use object
+            learning_rate=lr_slow,
             weight_decay=shakespeare_config.slow_weight_decay,
         ),
     )
@@ -189,10 +184,99 @@ if __name__ == "__main__":
     opt_state = optimizer.init(params)
 
 
+    def infer_forward_euler_with_force_and_hidden(params, V0, ctx_bits):
+        xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
+        L = ctx_bits.shape[1]
+        xi_pos = get_xi_pos(params, L, V0.shape[1])  # (L, D)
+        batch_xi_attn = xi_attn_embed[ctx_bits] + xi_pos[None, :, :]  # (B, L, D)
+        xi_hopf = get_xi_hopf(params)  # (M, D)
+
+        step_v = shakespeare_config.step_size / shakespeare_config.tau_v
+        step_h = shakespeare_config.step_size / shakespeare_config.tau_h
+
+        H_attn0 = jnp.einsum("bld,bd->bl", batch_xi_attn, V0) + params["b"]
+        H_hopf0 = V0 @ xi_hopf.T + params["c"]
+
+        def batch_energy(params, V, H_attn, H_hopf, F_attn, F_hopf):
+            def _sample_energy(v, h_attn, h_hopf, f_attn, f_hopf, xi_attn):
+                dv = v - params["a"]
+                vis = 0.5 * jnp.dot(dv, dv)
+                coupling = jnp.dot(v, xi_attn.T @ f_attn + xi_hopf.T @ f_hopf)
+                att_bias = jnp.dot(f_attn, h_attn - params["b"])
+                hopf_bias = jnp.dot(f_hopf, h_hopf - params["c"])
+                return vis - coupling + att_bias + hopf_bias - L_attn(h_attn, shakespeare_config) - L_hopf(h_hopf)
+
+            Eb = jax.vmap(_sample_energy, in_axes=(0, 0, 0, 0, 0, 0))(
+                V, H_attn, H_hopf, F_attn, F_hopf, batch_xi_attn
+            )
+            return jnp.sum(Eb)
+
+        grad_E = jax.grad(batch_energy, argnums=(1, 4, 5))  # grads wrt (V, F_attn, F_hopf)
+
+        def grads_activation(V, H_attn, H_hopf):
+            F_attn = jax.nn.softmax(shakespeare_config.beta * H_attn, axis=-1)
+            F_hopf = jnp.maximum(H_hopf, 0.0)
+            dE_dV, dE_dF_attn, dE_dF_hopf = grad_E(
+                params, V, H_attn, H_hopf, F_attn, F_hopf
+            )
+            return dE_dV, dE_dF_attn, dE_dF_hopf
+
+        def body(_, carry):
+            V, H_attn, H_hopf = carry
+            dE_dV, dE_dF_attn, dE_dF_hopf = grads_activation(V, H_attn, H_hopf)
+            V = V - step_v * dE_dV
+            H_attn = H_attn - step_h * dE_dF_attn
+            H_hopf = H_hopf - step_h * dE_dF_hopf
+            return (V, H_attn, H_hopf)
+
+        V_T, H_attn_T, H_hopf_T = jax.lax.fori_loop(
+            0, shakespeare_config.n_steps, body, (V0, H_attn0, H_hopf0)
+        )
+        dE_dV_T, _, _ = grads_activation(V_T, H_attn_T, H_hopf_T)
+        F_T = -(1.0 / shakespeare_config.tau_v) * dE_dV_T
+        return V_T, F_T, H_attn_T, H_hopf_T
+
+
+    def loss_and_metrics(params, ctx_bits, labels, force_weight):
+        B = ctx_bits.shape[0]
+        V0 = jnp.zeros((B, shakespeare_config.D), dtype=jnp.float32)
+        V_T, F_T, H_attn_T, H_hopf_T = infer_forward_euler_with_force_and_hidden(
+            params, V0, ctx_bits
+        )
+        logits_T = logits_from_v(params, V_T)
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits_T, labels).mean()
+        force_pen = jnp.mean(jnp.sum(F_T * F_T, axis=1))
+        loss = ce + force_weight * force_pen
+
+        attn = jax.nn.softmax(shakespeare_config.beta * H_attn_T, axis=-1)
+        attn_entropy = -jnp.sum(attn * jnp.log(jnp.maximum(attn, 1e-20)), axis=-1)
+        attn_entropy = jnp.mean(attn_entropy)
+        attn_max = jnp.mean(jnp.max(attn, axis=-1))
+
+        hopf_act = jnp.maximum(H_hopf_T, 0.0)
+        hopf_sat = jnp.mean((hopf_act > 0.0).astype(jnp.float32))
+
+        v_rms = jnp.sqrt(jnp.mean(jnp.sum(V_T * V_T, axis=1)))
+        force_rms = jnp.sqrt(jnp.mean(jnp.sum(F_T * F_T, axis=1)))
+        force_rel = force_rms / jnp.maximum(v_rms, 1e-8)
+
+        metrics = dict(
+            ce=ce,
+            force_pen=force_pen,
+            v_rms=v_rms,
+            force_rms=force_rms,
+            force_rel=force_rel,
+            attn_entropy=attn_entropy,
+            attn_max=attn_max,
+            hopf_sat=hopf_sat,
+        )
+        return loss, metrics
+
+
     @jax.jit
     def train_step(params, opt_state, train_X, train_Y, force_weight):
-        loss, grads = jax.value_and_grad(loss_fn)(
-            params, train_X, train_Y, force_weight, shakespeare_config
+        (loss, metrics), grads = jax.value_and_grad(loss_and_metrics, has_aux=True)(
+            params, train_X, train_Y, force_weight
         )
         grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -200,7 +284,7 @@ if __name__ == "__main__":
         param_norm = optax.global_norm(params)
         relative_step_size = update_norm / jnp.maximum(param_norm, 1e-8)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, grad_norm, relative_step_size
+        return params, opt_state, loss, grad_norm, relative_step_size, metrics
 
 
     losses_all = []
@@ -241,7 +325,7 @@ if __name__ == "__main__":
             batch_train_X = train_X_epoch[start:stop]
             batch_train_y = train_y_epoch[start:stop]
 
-            params, opt_state, loss, grad_norm, relative_step_size = train_step(
+            params, opt_state, loss, grad_norm, relative_step_size, metrics = train_step(
                 params,
                 opt_state,
                 batch_train_X,
@@ -257,11 +341,19 @@ if __name__ == "__main__":
             wandb.log(
                 {
                     "train/loss": float(loss),
+                    "train/ce": float(metrics["ce"]),
+                    "train/force_pen": float(metrics["force_pen"]),
                     "train/force_w": float(lam_force),
+                    "train/v_rms": float(metrics["v_rms"]),
+                    "train/force_rms": float(metrics["force_rms"]),
+                    "train/force_rel": float(metrics["force_rel"]),
+                    "train/attn_entropy": float(metrics["attn_entropy"]),
+                    "train/attn_max": float(metrics["attn_max"]),
+                    "train/hopf_sat": float(metrics["hopf_sat"]),
                     "train/grad_norm": float(grad_norm),
                     "train/relative_step_size": float(relative_step_size),
-                    "train/lr_fast": float(lr_schedule_fast(global_step)),
-                    "train/lr_slow": float(lr_schedule_slow(global_step)),
+                    "train/lr_fast": lr_fast,
+                    "train/lr_slow": lr_slow,
                     "epoch": epoch,
                 },
                 step=global_step,

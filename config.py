@@ -9,6 +9,9 @@ class Config:
     beta: float = 0.1
 
     xi_attn_embed_raw_scale: float = 0.1
+    # Position embedding added to each attention row: xi_attn[pos] = xi_tok[token] + xi_pos[pos]
+    # Squared at use-time to stay nonnegative / conductance-like.
+    xi_pos_raw_scale: float = 0.1
     xi_hopf_raw_scale: float = 0.06
 
     # --- Stable integration parameters ---
@@ -17,7 +20,7 @@ class Config:
     n_steps: int = field(init=False)
 
     batch_size: int = 256
-    train_epochs: int = 30_000
+    max_steps: int = 30_000
     seed: int = 0
     vocab_size: int = 2
 
@@ -26,6 +29,7 @@ class Config:
 
     lr_init_value: float = 0.0
     lr_peak_value: float = 3e-3
+    lr_end_factor: float = 0.3
     max_norm: float = 1.0
     slow_weight_decay: float = 5e-5
     fast_weight_decay: float = 0.0

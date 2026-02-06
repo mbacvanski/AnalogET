@@ -1,9 +1,10 @@
 #!/bin/bash
 # Script to run Shakespeare model training with all configurations in configs/ folder
 
-# Set temperature and generation characters
-TEMPERATURE=0.1
-GEN_CHARS=32
+# Set context length, temperature and generation characters
+CTX_LENGTH=64
+TEMPERATURE=0.01
+GEN_CHARS=64
 
 # Iterate through all config files in the configs directory
 for config_file in configs/config_*.json; do
@@ -14,9 +15,9 @@ for config_file in configs/config_*.json; do
         
         python model_shakespeare_train.py \
             --config "$config_file" \
+            --ctx_length $CTX_LENGTH \
             --temperature $TEMPERATURE \
             --gen_chars $GEN_CHARS \
-            --sample_mode
         
         echo ""
         echo "Completed: $config_file"

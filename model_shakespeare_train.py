@@ -29,6 +29,12 @@ if __name__ == "__main__":
         help="Path to JSON config file to initialize shakespeare_config",
     )
     parser.add_argument(
+        "--ctx_length",
+        type=int,
+        default=16,
+        help="Context length for training sequences (default: 16)",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.8,
@@ -49,21 +55,22 @@ if __name__ == "__main__":
     
     # Load or prepare Shakespeare dataset
     filename_prefix = "shakespeare_data"
-    dataset_exists = os.path.exists(f"data/{filename_prefix}_train_X.txt")
+    ctx_length = args.ctx_length
+    dataset_exists = os.path.exists(f"data/{filename_prefix}_ctx{ctx_length}_train_X.txt")
 
     if dataset_exists:
-        print("Loading Shakespeare dataset from saved files...")
+        print(f"Loading Shakespeare dataset from saved files (ctx_length={ctx_length})...")
         train_X, train_y, valid_X, valid_y, char_to_idx, idx_to_char = load_shakespeare_dataset(
-            filename_prefix=filename_prefix
+            ctx_length=ctx_length, filename_prefix=filename_prefix
         )
     else:
-        print("Preparing Shakespeare dataset...")
+        print(f"Preparing Shakespeare dataset (ctx_length={ctx_length})...")
         train_X, train_y, valid_X, valid_y, char_to_idx, idx_to_char = prepare_shakespeare_dataset(
-            ctx_length=16, train_ratio=0.9, filename_prefix=filename_prefix
+            ctx_length=ctx_length, train_ratio=0.9, filename_prefix=filename_prefix
         )
 
     vocab_size = len(char_to_idx)
-    print(f"Using vocab_size={vocab_size}")
+    print(f"Using vocab_size={vocab_size}, ctx_length={ctx_length}")
     
     # Apply sample mode if requested (limit to 1000 batches worth of data)
     if args.sample_mode:
@@ -83,13 +90,15 @@ if __name__ == "__main__":
         with open(args.config, "r") as f:
             config_dict = json.load(f)
         shakespeare_config = Config(
-            L=config_dict.get("L", 16),
+            L=ctx_length,
             vocab_size=vocab_size,
             **{k: v for k, v in config_dict.items() if k not in ["L", "vocab_size"]}
         )
+        if "L" in config_dict and config_dict["L"] != ctx_length:
+            raise ValueError(f"Config file has L={config_dict['L']}, but overriding with ctx_length={ctx_length}")
     else:
         shakespeare_config = Config(
-            L=16,
+            L=ctx_length,
             vocab_size=vocab_size,
         )
 
@@ -105,6 +114,7 @@ if __name__ == "__main__":
         for k in dir(shakespeare_config)
         if not k.startswith("_") and not callable(getattr(shakespeare_config, k))
     }
+    config_save_dict['ctx_length'] = ctx_length
     config_save_dict['sample_mode'] = args.sample_mode
     config_save_dict['temperature'] = args.temperature
     config_save_dict['gen_chars'] = args.gen_chars
@@ -211,8 +221,9 @@ if __name__ == "__main__":
 
     global_step = 0
     
-    # Prepare a seed context for text generation (use first sequence from validation)
-    seed_context = valid_X[0]
+    # Prepare seed contexts for text generation (one from train, one from validation)
+    seed_context_train = train_X[0]
+    seed_context_valid = valid_X[0]
 
     for epoch in range(shakespeare_config.train_epochs):
         t_start = time.time()
@@ -288,22 +299,40 @@ if __name__ == "__main__":
             perplexities_all.append(float(perplexity))
             perplexities_steps.append((epoch + 1) * num_batches - 1)
             
-            # Generate text
-            key, gen_key = jr.split(key)
-            generated_text = generate_text(
+            # Generate text from training example
+            key, gen_key_train = jr.split(key)
+            generated_text_train = generate_text(
                 params,
-                seed_context,
+                seed_context_train,
                 idx_to_char,
                 shakespeare_config,
                 num_chars=args.gen_chars,
                 temperature=args.temperature,
-                key=gen_key,
+                key=gen_key_train,
             )
-            generated_texts_all.append(generated_text)
+            
+            # Generate text from validation example
+            key, gen_key_valid = jr.split(key)
+            generated_text_valid = generate_text(
+                params,
+                seed_context_valid,
+                idx_to_char,
+                shakespeare_config,
+                num_chars=args.gen_chars,
+                temperature=args.temperature,
+                key=gen_key_valid,
+            )
+            
+            # Store both generated texts
+            generated_texts_all.append({
+                "train": generated_text_train,
+                "valid": generated_text_valid
+            })
             generated_texts_epochs.append(epoch)
             
-            # Show seed context for reference
-            seed_text = "".join([idx_to_char[int(idx)] for idx in seed_context])
+            # Show seed contexts for reference
+            seed_text_train = "".join([idx_to_char[int(idx)] for idx in seed_context_train])
+            seed_text_valid = "".join([idx_to_char[int(idx)] for idx in seed_context_valid])
 
             print(
                 f"epoch {epoch:5d} | "
@@ -313,8 +342,10 @@ if __name__ == "__main__":
                 f"perplexity {perplexity:8.4f} | "
                 f"{epoch_time:3.3f}s / epoch"
             )
-            print(f"  Seed: '{seed_text}'")
-            print(f"  Generated: '{generated_text}'")
+            print(f"  Train Seed: '{seed_text_train}'")
+            print(f"  Train Gen:  '{generated_text_train}'")
+            print(f"  Valid Seed: '{seed_text_valid}'")
+            print(f"  Valid Gen:  '{generated_text_valid}'")
 
             # ---- W&B eval logging ----
             wandb.log(
@@ -322,7 +353,14 @@ if __name__ == "__main__":
                     "valid/accuracy": float(acc),
                     "valid/perplexity": float(perplexity),
                     "valid/eval_epoch": epoch,
-                    "generated_text": wandb.Html(f"<pre>Seed: {seed_text}\nGenerated: {generated_text}</pre>"),
+                    "generated_text": wandb.Html(
+                        f"<pre><b>Training Example:</b>\n"
+                        f"Seed: {seed_text_train}\n"
+                        f"Generated: {generated_text_train}\n\n"
+                        f"<b>Validation Example:</b>\n"
+                        f"Seed: {seed_text_valid}\n"
+                        f"Generated: {generated_text_valid}</pre>"
+                    ),
                 },
                 step=global_step - 1,
             )

@@ -172,10 +172,10 @@ def prepare_shakespeare_dataset(
     
     # Save to disk
     os.makedirs("data", exist_ok=True)
-    np.savetxt(f"data/{filename_prefix}_train_X.txt", np.array(train_X), fmt="%d")
-    np.savetxt(f"data/{filename_prefix}_train_y.txt", np.array(train_y), fmt="%d")
-    np.savetxt(f"data/{filename_prefix}_valid_X.txt", np.array(valid_X), fmt="%d")
-    np.savetxt(f"data/{filename_prefix}_valid_y.txt", np.array(valid_y), fmt="%d")
+    np.savetxt(f"data/{filename_prefix}_ctx{ctx_length}_train_X.txt", np.array(train_X), fmt="%d")
+    np.savetxt(f"data/{filename_prefix}_ctx{ctx_length}_train_y.txt", np.array(train_y), fmt="%d")
+    np.savetxt(f"data/{filename_prefix}_ctx{ctx_length}_valid_X.txt", np.array(valid_X), fmt="%d")
+    np.savetxt(f"data/{filename_prefix}_ctx{ctx_length}_valid_y.txt", np.array(valid_y), fmt="%d")
     
     # Save vocabulary mappings as JSON
     # Convert keys to strings for JSON serialization
@@ -188,18 +188,20 @@ def prepare_shakespeare_dataset(
     with open(f"data/{filename_prefix}_idx_to_char.json", "w", encoding="utf-8") as f:
         json.dump(idx_to_char_str, f, ensure_ascii=False)
     
-    print(f"Saved dataset to data/{filename_prefix}_*.txt and vocabulary to data/{filename_prefix}_*.json")
+    print(f"Saved dataset to data/{filename_prefix}_ctx{ctx_length}_*.txt and vocabulary to data/{filename_prefix}_*.json")
     
     return train_X, train_y, valid_X, valid_y, char_to_idx, idx_to_char
 
 
 def load_shakespeare_dataset(
+    ctx_length: int = 16,
     filename_prefix: str = "shakespeare_data",
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, Dict[str, int], Dict[int, str]]:
     """
     Load Shakespeare dataset from saved files.
     
     Args:
+        ctx_length: Context length used when dataset was created (default 16)
         filename_prefix: Prefix for saved dataset files (default "shakespeare_data")
     
     Returns:
@@ -212,16 +214,16 @@ def load_shakespeare_dataset(
     """
     # Load datasets
     train_X = jnp.array(
-        np.loadtxt(f"data/{filename_prefix}_train_X.txt", dtype=np.int32)
+        np.loadtxt(f"data/{filename_prefix}_ctx{ctx_length}_train_X.txt", dtype=np.int32)
     )
     train_y = jnp.array(
-        np.loadtxt(f"data/{filename_prefix}_train_y.txt", dtype=np.int32)
+        np.loadtxt(f"data/{filename_prefix}_ctx{ctx_length}_train_y.txt", dtype=np.int32)
     )
     valid_X = jnp.array(
-        np.loadtxt(f"data/{filename_prefix}_valid_X.txt", dtype=np.int32)
+        np.loadtxt(f"data/{filename_prefix}_ctx{ctx_length}_valid_X.txt", dtype=np.int32)
     )
     valid_y = jnp.array(
-        np.loadtxt(f"data/{filename_prefix}_valid_y.txt", dtype=np.int32)
+        np.loadtxt(f"data/{filename_prefix}_ctx{ctx_length}_valid_y.txt", dtype=np.int32)
     )
     
     # Load vocabulary mappings
@@ -236,6 +238,7 @@ def load_shakespeare_dataset(
     idx_to_char = {int(idx): ch for idx, ch in idx_to_char_str.items()}
     
     print(f"Loaded dataset: {len(train_X)} training sequences, {len(valid_X)} validation sequences")
+    print(f"Context length: {ctx_length}")
     print(f"Vocabulary size: {len(char_to_idx)} unique characters")
     
     return train_X, train_y, valid_X, valid_y, char_to_idx, idx_to_char

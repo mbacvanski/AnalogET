@@ -151,7 +151,7 @@ if __name__ == "__main__":
 
 
     def lr_sched(
-            peak: float, warmup_steps: int = 0, end_factor: float = 0.3
+        peak: float, warmup_steps: int = 0
     ) -> optax.Schedule:
         """warm up to peak, then decay to peak * end_factor"""
         return optax.warmup_cosine_decay_schedule(
@@ -159,7 +159,7 @@ if __name__ == "__main__":
             peak_value=peak,
             warmup_steps=warmup_steps,
             decay_steps=max(1, total_steps - warmup_steps),
-            end_value=peak * end_factor,
+            end_value=peak * shakespeare_config.lr_end_factor,
         )
 
 

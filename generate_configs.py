@@ -40,17 +40,21 @@ class uniform:
 
 SWEEP = {
     # Discrete / architectural params
-    "D": choice([16, 24, 32]),
-    "M": choice([16, 24, 32]),
-    "batch_size": choice([128, 256, 512, 1024]),
+    "D": choice([32]),
+    "M": choice([16]),
+    "batch_size": choice([128]),
+    # "lr_end_factor": choice([0.003, 0.03, 0.3, 1]),
     # Continuous params — log-uniform over range
     "lr_peak_value": loguniform(1e-4, 3e-2),
-    "xi_attn_embed_raw_scale": loguniform(1e-3, 2e-2),
-    "xi_hopf_raw_scale": loguniform(1e-3, 2e-2),
-    "beta": loguniform(0.01, 1.0),
+    "lr_end_factor": loguniform(1e-3, 1e-0),
+    # "lr_peak_value": choice([0.01]),
+    # "xi_attn_embed_raw_scale": loguniform(1e-3, 2e-2),
+    "xi_attn_embed_raw_scale": choice([1e-3]),
+    # "xi_hopf_raw_scale": loguniform(1e-3, 2e-2),
+    "xi_hopf_raw_scale": choice([0.06]),
 }
 
-NUM_CONFIGS = 150
+NUM_CONFIGS = 50
 SEED = 42
 
 # ============================================================
@@ -64,16 +68,19 @@ DEFAULTS = {
     "step_size": 0.001,
     "T_final": 1.0,
     "train_epochs": 10,
+    "max_steps": 20_000,
     "seed": 0,
     "tau_v": 0.1,
     "tau_h": 0.01,
     "lr_init_value": 0.0,
+    "lr_peak_value": 0.01,
+    "beta": 0.1,
     "max_norm": 1.0,
     "slow_weight_decay": 5e-05,
     "fast_weight_decay": 0.0,
-    "force_penalty_start": 5,
-    "force_penalty_duration": 5,
-    "force_penalty_scale": 0.05,
+    "force_penalty_start": 999_999_999,
+    "force_penalty_duration": 1,
+    "force_penalty_scale": 0.0,
 }
 
 # ============================================================

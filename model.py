@@ -13,12 +13,15 @@ from utils import ModelParams
 
 
 def init_params(key: jax.Array, cfg: Config = config) -> ModelParams:
-    k1, k2, k3 = jr.split(key, 3)
+    k1, k2, k3, k4 = jr.split(key, 4)
 
     # token embedding (square to get xi_attn_embed)
     xi_attn_embed_raw = (
         jr.normal(k1, (cfg.vocab_size, cfg.D)) * cfg.xi_attn_embed_raw_scale
     )
+
+    # position embedding (square to get xi_pos)
+    xi_pos_raw = jr.normal(k4, (cfg.L, cfg.D)) * cfg.xi_pos_raw_scale
 
     # Hopfield memory (square to get xi_hopf)
     xi_hopf_raw = jr.normal(k2, (cfg.M, cfg.D)) * cfg.xi_hopf_raw_scale
@@ -38,6 +41,7 @@ def init_params(key: jax.Array, cfg: Config = config) -> ModelParams:
 
     return dict(
         xi_attn_embed_raw=xi_attn_embed_raw,
+        xi_pos_raw=xi_pos_raw,
         xi_hopf_raw=xi_hopf_raw,
         b=b,
         c=c,
@@ -50,6 +54,19 @@ def init_params(key: jax.Array, cfg: Config = config) -> ModelParams:
 def get_xi_attn_embed(params: ModelParams) -> jax.Array:
     """ensure positive values for xi_attn"""
     return jnp.square(params["xi_attn_embed_raw"])
+
+
+def get_xi_pos(params: ModelParams, L: int, D: int) -> jax.Array:
+    """Position embedding (L, D), nonnegative via squaring.
+
+    For backwards compatibility with older checkpoints that don't have xi_pos_raw,
+    we return zeros.
+    """
+    raw = params.get("xi_pos_raw", None)
+    if raw is None:
+        return jnp.zeros((L, D), dtype=jnp.float32)
+    xi = jnp.square(raw)
+    return xi[:L, :D]
 
 
 def get_xi_hopf(params: ModelParams) -> jax.Array:
@@ -78,7 +95,8 @@ def energy_per_sample(
 ) -> jax.Array:
     # Xi: (L, D) rows selected by the tokens in this sequence (positive-used)
     xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
-    xi_attn = xi_attn_embed[ctx_bits_row]  # (L, D)
+    xi_pos = get_xi_pos(params, cfg.L, cfg.D)  # (L, D)
+    xi_attn = xi_attn_embed[ctx_bits_row] + xi_pos  # (L, D)
 
     # Visible quadratic
     dv = v - params["a"]
@@ -129,7 +147,9 @@ def _init_hidden(
     """
     # Xi_seq: (B, L, D) using positive-used xi
     xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
-    batch_xi_attn = xi_attn_embed[ctx_bits]  # (B, L, D)
+    L = ctx_bits.shape[1]
+    xi_pos = get_xi_pos(params, L, V0.shape[1])  # (L, D)
+    batch_xi_attn = xi_attn_embed[ctx_bits] + xi_pos[None, :, :]  # (B, L, D)
     H_attn0 = jnp.einsum("bld,bd->bl", batch_xi_attn, V0) + params["b"]  # (B, L)
 
     # Positive-used eta
@@ -147,7 +167,9 @@ def infer_forward_euler_with_force(
       F_T: (B, D) force at V_T, i.e. dV/dt = -(1/tau_v) * dE/dV at V_T
     """
     xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
-    batch_xi_attn = xi_attn_embed[ctx_bits]  # (B, L, D)
+    L = ctx_bits.shape[1]
+    xi_pos = get_xi_pos(params, L, V0.shape[1])  # (L, D)
+    batch_xi_attn = xi_attn_embed[ctx_bits] + xi_pos[None, :, :]  # (B, L, D)
     step_v = cfg.step_size / cfg.tau_v
     step_h = cfg.step_size / cfg.tau_h
 
@@ -210,7 +232,9 @@ def infer_forward_euler(
       traj: dict of optional trajectories (currently V only)
     """
     xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
-    batch_xi_attn = xi_attn_embed[ctx_bits]  # (B, L, D)
+    L = ctx_bits.shape[1]
+    xi_pos = get_xi_pos(params, L, V0.shape[1])  # (L, D)
+    batch_xi_attn = xi_attn_embed[ctx_bits] + xi_pos[None, :, :]  # (B, L, D)
     H_attn0 = jnp.einsum("bld,bd->bl", batch_xi_attn, V0) + params["b"]
     H_hopf0 = V0 @ get_xi_hopf(params).T + params["c"]
 
@@ -395,7 +419,7 @@ def label_tree(params: ModelParams):
             name = last.key  # 'xi_attn_embed_raw', 'xi_hopf_raw', etc.
         else:
             name = str(last)
-        if name in ("xi_attn_embed_raw", "xi_hopf_raw"):
+        if name in ("xi_attn_embed_raw", "xi_pos_raw"):  # keep these "fast" by default
             return "fast"
         else:
             return "slow"

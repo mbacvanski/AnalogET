@@ -3,7 +3,7 @@
 
 # Set context length, temperature and generation characters
 CTX_LENGTH=64
-TEMPERATURE=0.01
+TEMPERATURE=0.8
 GEN_CHARS=64
 
 # Iterate through all config files in the configs directory

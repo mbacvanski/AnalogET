@@ -8,7 +8,7 @@
   "step_size": 0.001,
   "T_final": 1.0,
   "batch_size": 256,
-  "train_epochs": 30000,
+  "max_steps": 10000,
   "seed": 0,
   "tau_v": 0.1,
   "tau_h": 0.01,

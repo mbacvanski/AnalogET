@@ -4,7 +4,7 @@
 # Set context length, temperature and generation characters
 CTX_LENGTH=64
 TEMPERATURE=0.8
-GEN_CHARS=64
+GEN_CHARS=200
 
 # Iterate through all config files in the configs directory
 for config_file in configs/config_*.json; do
@@ -18,6 +18,7 @@ for config_file in configs/config_*.json; do
             --ctx_length $CTX_LENGTH \
             --temperature $TEMPERATURE \
             --gen_chars $GEN_CHARS \
+            --sample_mode \
         
         echo ""
         echo "Completed: $config_file"

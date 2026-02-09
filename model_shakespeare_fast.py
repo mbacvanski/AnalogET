@@ -368,6 +368,12 @@ if __name__ == "__main__":
         default=512,
         help="Batch size for validation accuracy/perplexity to bound memory (default: 512)",
     )
+    parser.add_argument(
+        "--train_log_every_steps",
+        type=int,
+        default=25,
+        help="Log training metrics every N optimizer steps to reduce batch-loop overhead (default: 25)",
+    )
     args = parser.parse_args()
 
     if args.init_weights and args.init_wandb_run:
@@ -455,6 +461,7 @@ if __name__ == "__main__":
     config_save_dict['sample_mode'] = args.sample_mode
     config_save_dict['log_full_weights_each_epoch'] = True
     config_save_dict['eval_batch_size'] = args.eval_batch_size
+    config_save_dict['train_log_every_steps'] = args.train_log_every_steps
     config_save_dict['temperature'] = args.temperature
     config_save_dict['gen_chars'] = args.gen_chars
     if args.config:
@@ -506,8 +513,26 @@ if __name__ == "__main__":
     if init_weight_stats:
         wandb.log({**init_weight_stats, "epoch": 0}, step=0)
 
-    num_train = train_X.shape[0]
-    num_batches = (num_train + shakespeare_config.batch_size - 1) // shakespeare_config.batch_size
+    if args.train_log_every_steps < 1:
+        raise ValueError(f"--train_log_every_steps must be >= 1, got {args.train_log_every_steps}")
+
+    batch_size = int(shakespeare_config.batch_size)
+    num_train_total = int(train_X.shape[0])
+    num_train = (num_train_total // batch_size) * batch_size
+    if num_train == 0:
+        raise ValueError(
+            f"Not enough training samples ({num_train_total}) for batch_size={batch_size}"
+        )
+    if num_train != num_train_total:
+        dropped = num_train_total - num_train
+        print(
+            f"Dropping {dropped} samples each epoch to keep fixed batch shape "
+            f"({num_train} used, batch_size={batch_size})"
+        )
+        train_X = train_X[:num_train]
+        train_y = train_y[:num_train]
+
+    num_batches = num_train // batch_size
     total_steps = shakespeare_config.train_epochs * num_batches
 
 
@@ -562,7 +587,6 @@ if __name__ == "__main__":
 
     # Function to create a train_step with a specific config captured in closure
     def make_train_step(cfg):
-        @jax.jit
         def train_step(params, opt_state, train_X, train_Y, force_weight):
             loss, grads = jax.value_and_grad(loss_fn)(
                 params, train_X, train_Y, force_weight, cfg
@@ -571,7 +595,8 @@ if __name__ == "__main__":
             updates, opt_state = optimizer.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
             return params, opt_state, loss, grad_norm
-        return train_step
+
+        return jax.jit(train_step, donate_argnums=(0, 1))
 
 
     # Initialize the train_step with current config
@@ -651,18 +676,16 @@ if __name__ == "__main__":
         t_start = time.time()
         key, key_perm = jr.split(key)
         index_perm = jr.permutation(key_perm, num_train)
-        train_X_epoch = train_X[index_perm]
-        train_y_epoch = train_y[index_perm]
-        losses_epoch = []
+        train_X_epoch = train_X[index_perm].reshape((num_batches, batch_size, train_X.shape[1]))
+        train_y_epoch = train_y[index_perm].reshape((num_batches, batch_size))
+        loss_sum = jnp.array(0.0, dtype=jnp.float32)
 
         lam_force = jnp.asarray(force_penalty_weight(epoch, current_config), dtype=jnp.float32)
+        lam_force_value = float(lam_force)
 
         for batch in range(num_batches):
-            start = batch * current_config.batch_size
-            stop = min((batch + 1) * current_config.batch_size, num_train)
-            key, sub = jr.split(key)
-            batch_train_X = train_X_epoch[start:stop]
-            batch_train_y = train_y_epoch[start:stop]
+            batch_train_X = train_X_epoch[batch]
+            batch_train_y = train_y_epoch[batch]
 
             params, opt_state, loss, grad_norm = train_step(
                 params,
@@ -672,34 +695,39 @@ if __name__ == "__main__":
                 force_weight=lam_force,
             )
 
-            losses_epoch.append(loss)
-            losses_all.append(float(loss))
-            losses_steps.append(global_step)
+            loss_sum = loss_sum + loss
 
-            # ---- W&B per-step logging ----
-            # If logging every step is too chatty, gate with: if global_step % 10 == 0:
-            log_dict = {
-                "train/loss": float(loss),
-                "train/force_w": float(lam_force),
-                "train/grad_norm": float(grad_norm),
-                "epoch": epoch,
-            }
-            
-            # Add learning rate logs based on optimizer type
-            if shakespeare_config.use_multi_transform:
-                log_dict["train/lr_fast"] = float(lr_schedule_fast(global_step))
-                log_dict["train/lr_slow"] = float(lr_schedule_slow(global_step))
-            else:
-                log_dict["train/lr"] = float(shakespeare_config.learning_rate)
-            
-            wandb.log(log_dict, step=global_step)
-            # ------------------------------------
+            # Keep host sync + logging out of most batch iterations.
+            should_log_step = (
+                global_step % args.train_log_every_steps == 0
+                or batch == num_batches - 1
+            )
+            if should_log_step:
+                loss_value = float(loss)
+                grad_norm_value = float(grad_norm)
+                losses_all.append(loss_value)
+                losses_steps.append(global_step)
+
+                log_dict = {
+                    "train/loss": loss_value,
+                    "train/force_w": lam_force_value,
+                    "train/grad_norm": grad_norm_value,
+                    "epoch": epoch,
+                }
+
+                if shakespeare_config.use_multi_transform:
+                    log_dict["train/lr_fast"] = float(lr_schedule_fast(global_step))
+                    log_dict["train/lr_slow"] = float(lr_schedule_slow(global_step))
+                else:
+                    log_dict["train/lr"] = float(shakespeare_config.learning_rate)
+
+                wandb.log(log_dict, step=global_step)
 
             global_step += 1
 
         t_end = time.time()
         epoch_time = t_end - t_start
-        mean_train_loss = float(jnp.mean(jnp.array(losses_epoch)))
+        mean_train_loss = float(loss_sum / num_batches)
 
         # Optional: log epoch aggregates every epoch (cheap and useful)
         wandb.log(

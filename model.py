@@ -82,6 +82,11 @@ def L_hopf(h: jax.Array) -> jax.Array:  # (B,M) -> (B,)
     r = jnp.maximum(h, 0.0)
     return 0.5 * jnp.sum(r * r, axis=-1)
 
+# def L_hopf(h: jax.Array) -> jax.Array:
+#     # (B, M) -> (B,)
+#     # derivative wrt h is tanh(h)
+#     return jnp.sum(jnp.log(jnp.cosh(h)), axis=-1)
+
 
 def energy_per_sample(
     params: ModelParams,
@@ -379,13 +384,33 @@ def loss_fn(
     return ce + force_weight * force_penalty(F_T)
 
 
-@functools.partial(jax.jit, static_argnames=("cfg",))
-def evaluate(params: ModelParams, valid_X: jax.Array, valid_y: jax.Array, cfg: Config = config) -> jax.Array:
-    V_T, _ = infer_forward_euler_with_force(
-        params, jnp.zeros((valid_y.shape[0], cfg.D), jnp.float32), valid_X, cfg
-    )
-    preds = jnp.argmax(logits_from_v(params, V_T), axis=1)
-    return jnp.mean((preds == valid_y).astype(jnp.float32))
+def evaluate(
+    params: ModelParams,
+    valid_X: jax.Array,
+    valid_y: jax.Array,
+    cfg: Config = config,
+    batch_size: int = 512,
+) -> jax.Array:
+    """Evaluate accuracy in chunks to avoid full-validation OOM."""
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    n = int(valid_y.shape[0])
+    if n == 0:
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    correct = 0
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        x_batch = valid_X[start:stop]
+        y_batch = valid_y[start:stop]
+        V_T, _ = infer_forward_euler_with_force(
+            params, jnp.zeros((y_batch.shape[0], cfg.D), jnp.float32), x_batch, cfg
+        )
+        preds = jnp.argmax(logits_from_v(params, V_T), axis=1)
+        correct += int(jnp.sum((preds == y_batch).astype(jnp.int32)))
+
+    return jnp.array(correct / n, dtype=jnp.float32)
 
 
 def force_penalty_weight(epoch: int, cfg: Config = config) -> float:

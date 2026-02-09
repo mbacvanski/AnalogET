@@ -1,31 +1,30 @@
 #!/bin/bash
-# Script to run Shakespeare model training with all configurations in configs/ folder
+# Script to run training for Shakespeare model
 
-# Set context length, temperature and generation characters
+# Configuration
 CTX_LENGTH=64
 TEMPERATURE=0.8
 GEN_CHARS=200
 
-# Iterate through all config files in the configs directory
-for config_file in configs/config_*.json; do
-    if [ -f "$config_file" ]; then
-        echo "=========================================="
-        echo "Running training with config: $config_file"
-        echo "=========================================="
-        
-        python model_shakespeare_train.py \
-            --config "$config_file" \
-            --ctx_length $CTX_LENGTH \
-            --temperature $TEMPERATURE \
-            --gen_chars $GEN_CHARS \
-            --sample_mode \
-        
-        echo ""
-        echo "Completed: $config_file"
-        echo ""
-    fi
-done
+# Path to pre-trained weights to initialize from
+CONFIG="configs/config_256_10steps.json"
+
 
 echo "=========================================="
-echo "All configurations completed!"
+echo "Starting Training"
+echo "=========================================="
+echo "Init weights: $INIT_WEIGHTS"
+echo "Base T_final: $BASE_T_FINAL (n_steps=${BASE_T_FINAL%.*}0 per phase)"
+echo "Phase length: $PHASE_LENGTH epochs"
+echo "=========================================="
+
+python model_shakespeare_train.py \
+    --config $CONFIG \
+    --ctx_length $CTX_LENGTH \
+    --temperature $TEMPERATURE \
+    --gen_chars $GEN_CHARS \
+
+echo ""
+echo "=========================================="
+echo "Training completed!"
 echo "=========================================="

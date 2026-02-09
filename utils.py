@@ -92,7 +92,7 @@ def generate_text(
 
 
 def calculate_perplexity(
-    params, valid_X: jnp.ndarray, valid_y: jnp.ndarray, cfg
+    params, valid_X: jnp.ndarray, valid_y: jnp.ndarray, cfg, batch_size: int = 512
 ) -> float:
     """
     Calculate perplexity on validation set.
@@ -102,18 +102,30 @@ def calculate_perplexity(
     # Import here to avoid circular dependency
     from model import infer_forward_euler_with_force, logits_from_v
     
-    V_T, _ = infer_forward_euler_with_force(
-        params, jnp.zeros((valid_y.shape[0], cfg.D), jnp.float32), valid_X, cfg
-    )
-    logits = logits_from_v(params, V_T)
-    
-    # Calculate cross-entropy
-    ce_losses = optax.softmax_cross_entropy_with_integer_labels(logits, valid_y)
-    avg_ce = jnp.mean(ce_losses)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    n = int(valid_y.shape[0])
+    if n == 0:
+        return float("inf")
+
+    ce_sum = 0.0
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        x_batch = valid_X[start:stop]
+        y_batch = valid_y[start:stop]
+        V_T, _ = infer_forward_euler_with_force(
+            params, jnp.zeros((y_batch.shape[0], cfg.D), jnp.float32), x_batch, cfg
+        )
+        logits = logits_from_v(params, V_T)
+        ce_losses = optax.softmax_cross_entropy_with_integer_labels(logits, y_batch)
+        ce_sum += float(jnp.sum(ce_losses))
+
+    avg_ce = ce_sum / n
     
     # Perplexity is exp(cross-entropy)
-    perplexity = jnp.exp(avg_ce)
-    
+    perplexity = jnp.exp(jnp.array(avg_ce, dtype=jnp.float32))
+
     return float(perplexity)
 
 

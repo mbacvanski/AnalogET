@@ -7,7 +7,7 @@ TEMPERATURE=0.8
 GEN_CHARS=200
 
 # Path to pre-trained weights to initialize from
-CONFIG="configs/config_256_10steps.json"
+CONFIG="configs/config_256_100steps.json"
 
 
 echo "=========================================="

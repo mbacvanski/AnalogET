@@ -193,7 +193,9 @@ def download_wandb_checkpoint(
         raise FileNotFoundError(
             f"File '{file_name}' not found in W&B run '{run_path}'. {available_note} "
             "If this run only logged `weights_snapshot/*` histograms, those are not "
-            "recoverable as exact model tensors for resume."
+            "recoverable as exact model tensors for resume. Also note: "
+            "`run-<id>-history` / `wandb-history` artifacts contain metric history, "
+            "not model checkpoint tensors."
         )
 
     local_root = os.path.join(download_root, *run_path.split("/"))
@@ -289,6 +291,109 @@ def validate_checkpoint_shapes(params: Dict[str, Any], cfg: Config) -> None:
         raise ValueError("Checkpoint is incompatible with active config:\n" + "\n".join(details))
 
 
+def build_epoch_checkpoint_file(epoch: int) -> str:
+    if epoch < 0:
+        raise ValueError(f"Checkpoint epoch must be >= 0, got {epoch}")
+    return f"checkpoints/model_shakespeare_epoch_{epoch:04d}.npz"
+
+
+def infer_ctx_length_from_wandb_run(run: Any) -> int:
+    run_cfg = getattr(run, "config", {}) or {}
+    for key in ("ctx_length", "L"):
+        if key not in run_cfg:
+            continue
+        value = _wandb_cfg_value(run_cfg[key])
+        try:
+            ctx = _as_int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid {key} in W&B run config: {value!r}") from exc
+        if ctx <= 0:
+            raise ValueError(f"Invalid {key} in W&B run config: {ctx} (must be > 0)")
+        return ctx
+    raise ValueError(
+        "Could not infer ctx_length from W&B run config; expected `ctx_length` or `L`."
+    )
+
+
+def extract_wandb_config_init_kwargs(run: Any) -> Dict[str, Any]:
+    """Extract Config __init__ kwargs from a W&B run config."""
+    run_cfg = getattr(run, "config", {}) or {}
+    keys = [
+        "D",
+        "M",
+        "beta",
+        "xi_attn_embed_raw_scale",
+        "xi_pos_raw_scale",
+        "xi_hopf_raw_scale",
+        "step_size",
+        "T_final",
+        "batch_size",
+        "train_epochs",
+        "max_steps",
+        "seed",
+        "tau_v",
+        "tau_h",
+        "use_multi_transform",
+        "lr_init_value",
+        "lr_peak_value",
+        "learning_rate",
+        "lr_end_factor",
+        "max_norm",
+        "slow_weight_decay",
+        "fast_weight_decay",
+        "force_penalty_start",
+        "force_penalty_duration",
+        "force_penalty_scale",
+    ]
+    int_keys = {
+        "D",
+        "M",
+        "batch_size",
+        "train_epochs",
+        "max_steps",
+        "seed",
+        "force_penalty_start",
+        "force_penalty_duration",
+    }
+    float_keys = {
+        "beta",
+        "xi_attn_embed_raw_scale",
+        "xi_pos_raw_scale",
+        "xi_hopf_raw_scale",
+        "step_size",
+        "T_final",
+        "tau_v",
+        "tau_h",
+        "lr_init_value",
+        "lr_peak_value",
+        "learning_rate",
+        "lr_end_factor",
+        "max_norm",
+        "slow_weight_decay",
+        "fast_weight_decay",
+        "force_penalty_scale",
+    }
+    bool_keys = {"use_multi_transform"}
+
+    out: Dict[str, Any] = {}
+    for key in keys:
+        if key not in run_cfg:
+            continue
+        raw = _wandb_cfg_value(run_cfg[key])
+        try:
+            if key in int_keys:
+                out[key] = int(raw)
+            elif key in float_keys:
+                out[key] = float(raw)
+            elif key in bool_keys:
+                out[key] = bool(raw)
+            else:
+                out[key] = raw
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid `{key}` value in W&B run config: {raw!r}") from exc
+    return out
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Train Shakespeare character prediction model")
@@ -296,13 +401,13 @@ if __name__ == "__main__":
         "--config",
         type=str,
         default=None,
-        help="Path to JSON config file to initialize shakespeare_config",
+        help="Path to JSON config file; if omitted with W&B init, build config from W&B run config",
     )
     parser.add_argument(
         "--ctx_length",
         type=int,
-        default=16,
-        help="Context length for training sequences (default: 16)",
+        default=None,
+        help="Context length for training sequences (default: 16, or inferred from W&B run)",
     )
     parser.add_argument(
         "--temperature",
@@ -334,10 +439,34 @@ if __name__ == "__main__":
         help="W&B source run reference for initialization (`entity/project/run_id` or run URL)",
     )
     parser.add_argument(
+        "--init_wandb_run_id",
+        type=str,
+        default=None,
+        help="W&B source run ID only (e.g., k9arebfp); requires --init_wandb_epoch",
+    )
+    parser.add_argument(
+        "--init_wandb_epoch",
+        type=int,
+        default=None,
+        help="Epoch to resume from when using --init_wandb_run_id or --init_wandb_run",
+    )
+    parser.add_argument(
+        "--init_wandb_entity",
+        type=str,
+        default="qpaig",
+        help="W&B entity for --init_wandb_run_id mode (default: qpaig)",
+    )
+    parser.add_argument(
+        "--init_wandb_project",
+        type=str,
+        default="analog-et",
+        help="W&B project for --init_wandb_run_id mode (default: analog-et)",
+    )
+    parser.add_argument(
         "--init_wandb_file",
         type=str,
-        default="model_shakespeare.npz",
-        help="Checkpoint file name within the W&B run (default: model_shakespeare.npz)",
+        default=None,
+        help="Checkpoint file name within the W&B run (default: model_shakespeare.npz, or derived from --init_wandb_epoch)",
     )
     parser.add_argument(
         "--init_wandb_root",
@@ -370,12 +499,74 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.init_weights and args.init_wandb_run:
-        parser.error("Use only one of --init_weights or --init_wandb_run, not both.")
+    using_wandb_source = bool(args.init_wandb_run or args.init_wandb_run_id)
+    if args.init_weights and using_wandb_source:
+        parser.error(
+            "Use only one of --init_weights or W&B init args "
+            "(--init_wandb_run/--init_wandb_run_id)."
+        )
+    if args.init_wandb_run and args.init_wandb_run_id:
+        parser.error("Use only one of --init_wandb_run or --init_wandb_run_id.")
+    if args.init_wandb_run_id and args.init_wandb_epoch is None:
+        parser.error("--init_wandb_run_id requires --init_wandb_epoch.")
+    if args.init_wandb_epoch is not None and not using_wandb_source:
+        parser.error("--init_wandb_epoch requires --init_wandb_run or --init_wandb_run_id.")
+    if args.init_wandb_epoch is not None and args.init_wandb_file is not None:
+        parser.error("Use either --init_wandb_epoch or --init_wandb_file, not both.")
+    if args.init_wandb_epoch is not None and args.init_wandb_epoch < 0:
+        parser.error(f"--init_wandb_epoch must be >= 0, got {args.init_wandb_epoch}.")
     
+    effective_init_weights = args.init_weights
+    resolved_wandb_run = None
+    resolved_wandb_file = None
+    resolved_wandb_epoch = args.init_wandb_epoch
+    source_run = None
+    wandb_config_kwargs = None
+    if args.init_wandb_run or args.init_wandb_run_id:
+        if args.init_wandb_run_id:
+            resolved_wandb_run = (
+                f"{args.init_wandb_entity}/{args.init_wandb_project}/{args.init_wandb_run_id}"
+            )
+        else:
+            resolved_wandb_run = parse_wandb_run_ref(args.init_wandb_run)
+
+        if resolved_wandb_epoch is not None:
+            resolved_wandb_file = build_epoch_checkpoint_file(resolved_wandb_epoch)
+        elif args.init_wandb_file:
+            resolved_wandb_file = args.init_wandb_file
+        else:
+            resolved_wandb_file = "model_shakespeare.npz"
+
+        print(
+            f"Downloading initialization checkpoint '{resolved_wandb_file}' from W&B run "
+            f"'{resolved_wandb_run}'..."
+        )
+        effective_init_weights, source_run = download_wandb_checkpoint(
+            run_path=resolved_wandb_run,
+            file_name=resolved_wandb_file,
+            download_root=args.init_wandb_root,
+        )
+        print(f"Downloaded checkpoint to: {effective_init_weights}")
+        if args.ctx_length is None:
+            ctx_length = infer_ctx_length_from_wandb_run(source_run)
+            print(f"Inferred ctx_length={ctx_length} from W&B run config.")
+        else:
+            ctx_length = args.ctx_length
+        if args.config is None:
+            wandb_config_kwargs = extract_wandb_config_init_kwargs(source_run)
+    else:
+        if args.ctx_length is not None:
+            ctx_length = args.ctx_length
+        elif args.config:
+            with open(args.config, "r") as f:
+                pre_cfg = json.load(f)
+            ctx_length = int(pre_cfg.get("L", 16))
+            print(f"Inferred ctx_length={ctx_length} from local config file.")
+        else:
+            ctx_length = 16
+
     # Load or prepare Shakespeare dataset
     filename_prefix = "shakespeare_data"
-    ctx_length = args.ctx_length
     dataset_exists = os.path.exists(f"data/{filename_prefix}_ctx{ctx_length}_train_X.txt")
 
     if dataset_exists:
@@ -404,7 +595,7 @@ if __name__ == "__main__":
             valid_X = valid_X[:max_samples]
             valid_y = valid_y[:max_samples]
 
-    # Initialize config from JSON file if provided, otherwise use defaults
+    # Initialize config from JSON file, W&B run config, or defaults.
     if args.config:
         print(f"Loading config from {args.config}")
         with open(args.config, "r") as f:
@@ -416,27 +607,20 @@ if __name__ == "__main__":
         )
         if "L" in config_dict and config_dict["L"] != ctx_length:
             raise ValueError(f"Config file has L={config_dict['L']}, but overriding with ctx_length={ctx_length}")
+    elif wandb_config_kwargs is not None:
+        print("Building config from W&B run config (no local --config provided).")
+        shakespeare_config = Config(
+            L=ctx_length,
+            vocab_size=vocab_size,
+            **wandb_config_kwargs,
+        )
     else:
         shakespeare_config = Config(
             L=ctx_length,
             vocab_size=vocab_size,
         )
 
-    effective_init_weights = args.init_weights
-    resolved_wandb_run = None
-    source_run = None
-    if args.init_wandb_run:
-        resolved_wandb_run = parse_wandb_run_ref(args.init_wandb_run)
-        print(
-            f"Downloading initialization checkpoint '{args.init_wandb_file}' from W&B run "
-            f"'{resolved_wandb_run}'..."
-        )
-        effective_init_weights, source_run = download_wandb_checkpoint(
-            run_path=resolved_wandb_run,
-            file_name=args.init_wandb_file,
-            download_root=args.init_wandb_root,
-        )
-        print(f"Downloaded checkpoint to: {effective_init_weights}")
+    if source_run is not None:
         validate_wandb_run_config_compat(source_run, shakespeare_config)
 
     # Create timestamped output directory
@@ -459,12 +643,20 @@ if __name__ == "__main__":
     config_save_dict['gen_chars'] = args.gen_chars
     if args.config:
         config_save_dict['config_file'] = args.config
+    elif source_run is not None:
+        config_save_dict['config_from_wandb_run'] = True
     if effective_init_weights:
         config_save_dict['init_weights'] = effective_init_weights
-    if args.init_wandb_run:
+    if resolved_wandb_run:
         config_save_dict['init_wandb_run'] = resolved_wandb_run
-        config_save_dict['init_wandb_file'] = args.init_wandb_file
+        config_save_dict['init_wandb_file'] = resolved_wandb_file
         config_save_dict['init_wandb_root'] = args.init_wandb_root
+        if args.init_wandb_run_id:
+            config_save_dict['init_wandb_run_id'] = args.init_wandb_run_id
+            config_save_dict['init_wandb_entity'] = args.init_wandb_entity
+            config_save_dict['init_wandb_project'] = args.init_wandb_project
+        if resolved_wandb_epoch is not None:
+            config_save_dict['init_wandb_epoch'] = resolved_wandb_epoch
     config_save_dict['curriculum_T_final'] = args.curriculum_T_final
     if args.curriculum_T_final:
         config_save_dict['curriculum_base_T_final'] = args.curriculum_base_T_final

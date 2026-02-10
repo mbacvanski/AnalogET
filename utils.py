@@ -71,7 +71,10 @@ def generate_text(
         
         # Run inference
         V_T, _ = infer_forward_euler_with_force(
-            params, jnp.zeros((1, cfg.D), jnp.float32), ctx_batch, cfg
+            params,
+            jnp.zeros((1, cfg.D), jnp.float32),
+            ctx_batch,
+            cfg,
         )
         logits = logits_from_v(params, V_T)[0]  # (vocab_size,)
         
@@ -92,7 +95,11 @@ def generate_text(
 
 
 def calculate_perplexity(
-    params, valid_X: jnp.ndarray, valid_y: jnp.ndarray, cfg, batch_size: int = 512
+    params,
+    valid_X: jnp.ndarray,
+    valid_y: jnp.ndarray,
+    cfg,
+    batch_size: int = 512,
 ) -> float:
     """
     Calculate perplexity on validation set.
@@ -115,7 +122,10 @@ def calculate_perplexity(
         x_batch = valid_X[start:stop]
         y_batch = valid_y[start:stop]
         V_T, _ = infer_forward_euler_with_force(
-            params, jnp.zeros((y_batch.shape[0], cfg.D), jnp.float32), x_batch, cfg
+            params,
+            jnp.zeros((y_batch.shape[0], cfg.D), jnp.float32),
+            x_batch,
+            cfg,
         )
         logits = logits_from_v(params, V_T)
         ce_losses = optax.softmax_cross_entropy_with_integer_labels(logits, y_batch)

@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime
+import gc
 import json
 import os
 from typing import Any, Dict, List, Tuple
@@ -21,18 +22,21 @@ from model import evaluate, force_penalty_weight, init_params, label_tree, loss_
 from utils import calculate_perplexity, generate_text, load_params, plot_training_metrics, save_metrics, save_params
 
 
-def get_T_final_for_epoch(epoch: int, base_T_final: float = 0.01, phase_length: int = 20) -> float:
+def get_T_final_for_step(
+    step: int,
+    num_batches_per_epoch: int,
+    start_T_final: float,
+    base_T_final: float = 0.01,
+    phase_length: float = 20.0,
+) -> float:
     """
-    Calculate T_final based on epoch number.
-    
-    T_final increases by base_T_final every phase_length epochs:
-    - Epochs 0-19: T_final = 0.01 (n_steps = 10 with step_size=0.001)
-    - Epochs 20-39: T_final = 0.02 (n_steps = 20)
-    - Epochs 40-59: T_final = 0.03 (n_steps = 30)
-    - ...
+    Calculate smoothly swept T_final based on global step number.
+
+    Keeps the same curriculum logic ("increase by base every phase"), but
+    applies it continuously over steps and anchors to `start_T_final`.
     """
-    phase = epoch // phase_length
-    return base_T_final * (phase + 1)
+    steps_per_phase = max(1.0, phase_length * num_batches_per_epoch)
+    return start_T_final + (base_T_final * (step / steps_per_phase))
 
 
 def params_weight_stats(params) -> Dict[str, float]:
@@ -193,7 +197,9 @@ def download_wandb_checkpoint(
         raise FileNotFoundError(
             f"File '{file_name}' not found in W&B run '{run_path}'. {available_note} "
             "If this run only logged `weights_snapshot/*` histograms, those are not "
-            "recoverable as exact model tensors for resume."
+            "recoverable as exact model tensors for resume. Also note: "
+            "`run-<id>-history` / `wandb-history` artifacts contain metric history, "
+            "not model checkpoint tensors."
         )
 
     local_root = os.path.join(download_root, *run_path.split("/"))
@@ -289,6 +295,109 @@ def validate_checkpoint_shapes(params: Dict[str, Any], cfg: Config) -> None:
         raise ValueError("Checkpoint is incompatible with active config:\n" + "\n".join(details))
 
 
+def build_epoch_checkpoint_file(epoch: int) -> str:
+    if epoch < 0:
+        raise ValueError(f"Checkpoint epoch must be >= 0, got {epoch}")
+    return f"checkpoints/model_shakespeare_epoch_{epoch:04d}.npz"
+
+
+def infer_ctx_length_from_wandb_run(run: Any) -> int:
+    run_cfg = getattr(run, "config", {}) or {}
+    for key in ("ctx_length", "L"):
+        if key not in run_cfg:
+            continue
+        value = _wandb_cfg_value(run_cfg[key])
+        try:
+            ctx = _as_int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid {key} in W&B run config: {value!r}") from exc
+        if ctx <= 0:
+            raise ValueError(f"Invalid {key} in W&B run config: {ctx} (must be > 0)")
+        return ctx
+    raise ValueError(
+        "Could not infer ctx_length from W&B run config; expected `ctx_length` or `L`."
+    )
+
+
+def extract_wandb_config_init_kwargs(run: Any) -> Dict[str, Any]:
+    """Extract Config __init__ kwargs from a W&B run config."""
+    run_cfg = getattr(run, "config", {}) or {}
+    keys = [
+        "D",
+        "M",
+        "beta",
+        "xi_attn_embed_raw_scale",
+        "xi_pos_raw_scale",
+        "xi_hopf_raw_scale",
+        "step_size",
+        "T_final",
+        "batch_size",
+        "train_epochs",
+        "max_steps",
+        "seed",
+        "tau_v",
+        "tau_h",
+        "use_multi_transform",
+        "lr_init_value",
+        "lr_peak_value",
+        "learning_rate",
+        "lr_end_factor",
+        "max_norm",
+        "slow_weight_decay",
+        "fast_weight_decay",
+        "force_penalty_start",
+        "force_penalty_duration",
+        "force_penalty_scale",
+    ]
+    int_keys = {
+        "D",
+        "M",
+        "batch_size",
+        "train_epochs",
+        "max_steps",
+        "seed",
+        "force_penalty_start",
+        "force_penalty_duration",
+    }
+    float_keys = {
+        "beta",
+        "xi_attn_embed_raw_scale",
+        "xi_pos_raw_scale",
+        "xi_hopf_raw_scale",
+        "step_size",
+        "T_final",
+        "tau_v",
+        "tau_h",
+        "lr_init_value",
+        "lr_peak_value",
+        "learning_rate",
+        "lr_end_factor",
+        "max_norm",
+        "slow_weight_decay",
+        "fast_weight_decay",
+        "force_penalty_scale",
+    }
+    bool_keys = {"use_multi_transform"}
+
+    out: Dict[str, Any] = {}
+    for key in keys:
+        if key not in run_cfg:
+            continue
+        raw = _wandb_cfg_value(run_cfg[key])
+        try:
+            if key in int_keys:
+                out[key] = int(raw)
+            elif key in float_keys:
+                out[key] = float(raw)
+            elif key in bool_keys:
+                out[key] = bool(raw)
+            else:
+                out[key] = raw
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid `{key}` value in W&B run config: {raw!r}") from exc
+    return out
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Train Shakespeare character prediction model")
@@ -296,13 +405,13 @@ if __name__ == "__main__":
         "--config",
         type=str,
         default=None,
-        help="Path to JSON config file to initialize shakespeare_config",
+        help="Path to JSON config file; if omitted with W&B init, build config from W&B run config",
     )
     parser.add_argument(
         "--ctx_length",
         type=int,
-        default=16,
-        help="Context length for training sequences (default: 16)",
+        default=None,
+        help="Context length for training sequences (default: 16, or inferred from W&B run)",
     )
     parser.add_argument(
         "--temperature",
@@ -334,10 +443,34 @@ if __name__ == "__main__":
         help="W&B source run reference for initialization (`entity/project/run_id` or run URL)",
     )
     parser.add_argument(
+        "--init_wandb_run_id",
+        type=str,
+        default=None,
+        help="W&B source run ID only (e.g., k9arebfp); requires --init_wandb_epoch",
+    )
+    parser.add_argument(
+        "--init_wandb_epoch",
+        type=int,
+        default=None,
+        help="Epoch to resume from when using --init_wandb_run_id or --init_wandb_run",
+    )
+    parser.add_argument(
+        "--init_wandb_entity",
+        type=str,
+        default="qpaig",
+        help="W&B entity for --init_wandb_run_id mode (default: qpaig)",
+    )
+    parser.add_argument(
+        "--init_wandb_project",
+        type=str,
+        default="analog-et",
+        help="W&B project for --init_wandb_run_id mode (default: analog-et)",
+    )
+    parser.add_argument(
         "--init_wandb_file",
         type=str,
-        default="model_shakespeare.npz",
-        help="Checkpoint file name within the W&B run (default: model_shakespeare.npz)",
+        default=None,
+        help="Checkpoint file name within the W&B run (default: model_shakespeare.npz, or derived from --init_wandb_epoch)",
     )
     parser.add_argument(
         "--init_wandb_root",
@@ -348,7 +481,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--curriculum_T_final",
         action="store_true",
-        help="Enable curriculum learning for T_final: increase T_final by 0.01 every 20 epochs while keeping step_size=0.001",
+        help="Enable curriculum learning for T_final: smoothly increase T_final over steps so each 20-epoch phase adds 0.01 while keeping step_size=0.001",
     )
     parser.add_argument(
         "--curriculum_base_T_final",
@@ -358,9 +491,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--curriculum_phase_length",
-        type=int,
-        default=20,
-        help="Number of epochs per phase in curriculum learning (default: 20)",
+        type=float,
+        default=20.0,
+        help="Number of epochs per phase in curriculum learning; can be fractional (default: 20.0)",
     )
     parser.add_argument(
         "--eval_batch_size",
@@ -371,17 +504,89 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_log_every_steps",
         type=int,
-        default=25,
+        default=1,
         help="Log training metrics every N optimizer steps to reduce batch-loop overhead (default: 25)",
+    )
+    parser.add_argument(
+        "--clear_jax_cache_every_steps",
+        type=int,
+        default=1000,
+        help="Clear JAX compile caches every N training steps (<=0 disables, default: 1000)",
     )
     args = parser.parse_args()
 
-    if args.init_weights and args.init_wandb_run:
-        parser.error("Use only one of --init_weights or --init_wandb_run, not both.")
+    using_wandb_source = bool(args.init_wandb_run or args.init_wandb_run_id)
+    if args.init_weights and using_wandb_source:
+        parser.error(
+            "Use only one of --init_weights or W&B init args "
+            "(--init_wandb_run/--init_wandb_run_id)."
+        )
+    if args.init_wandb_run and args.init_wandb_run_id:
+        parser.error("Use only one of --init_wandb_run or --init_wandb_run_id.")
+    if args.init_wandb_run_id and args.init_wandb_epoch is None:
+        parser.error("--init_wandb_run_id requires --init_wandb_epoch.")
+    if args.init_wandb_epoch is not None and not using_wandb_source:
+        parser.error("--init_wandb_epoch requires --init_wandb_run or --init_wandb_run_id.")
+    if args.init_wandb_epoch is not None and args.init_wandb_file is not None:
+        parser.error("Use either --init_wandb_epoch or --init_wandb_file, not both.")
+    if args.init_wandb_epoch is not None and args.init_wandb_epoch < 0:
+        parser.error(f"--init_wandb_epoch must be >= 0, got {args.init_wandb_epoch}.")
+    if args.curriculum_phase_length <= 0:
+        parser.error(
+            f"--curriculum_phase_length must be > 0, got {args.curriculum_phase_length}."
+        )
     
+    effective_init_weights = args.init_weights
+    resolved_wandb_run = None
+    resolved_wandb_file = None
+    resolved_wandb_epoch = args.init_wandb_epoch
+    source_run = None
+    wandb_config_kwargs = None
+    if args.init_wandb_run or args.init_wandb_run_id:
+        if args.init_wandb_run_id:
+            resolved_wandb_run = (
+                f"{args.init_wandb_entity}/{args.init_wandb_project}/{args.init_wandb_run_id}"
+            )
+        else:
+            resolved_wandb_run = parse_wandb_run_ref(args.init_wandb_run)
+
+        if resolved_wandb_epoch is not None:
+            resolved_wandb_file = build_epoch_checkpoint_file(resolved_wandb_epoch)
+        elif args.init_wandb_file:
+            resolved_wandb_file = args.init_wandb_file
+        else:
+            resolved_wandb_file = "model_shakespeare.npz"
+
+        print(
+            f"Downloading initialization checkpoint '{resolved_wandb_file}' from W&B run "
+            f"'{resolved_wandb_run}'..."
+        )
+        effective_init_weights, source_run = download_wandb_checkpoint(
+            run_path=resolved_wandb_run,
+            file_name=resolved_wandb_file,
+            download_root=args.init_wandb_root,
+        )
+        print(f"Downloaded checkpoint to: {effective_init_weights}")
+        if args.ctx_length is None:
+            ctx_length = infer_ctx_length_from_wandb_run(source_run)
+            print(f"Inferred ctx_length={ctx_length} from W&B run config.")
+        else:
+            ctx_length = args.ctx_length
+        if args.config is None:
+            wandb_config_kwargs = extract_wandb_config_init_kwargs(source_run)
+    else:
+        if args.ctx_length is not None:
+            ctx_length = args.ctx_length
+        elif args.config:
+            with open(args.config, "r") as f:
+                pre_cfg = json.load(f)
+            ctx_length = int(pre_cfg.get("L", 16))
+            print(f"Inferred ctx_length={ctx_length} from local config file.")
+        else:
+            ctx_length = 16
+
     # Load or prepare Shakespeare dataset
     filename_prefix = "shakespeare_data"
-    ctx_length = args.ctx_length
     dataset_exists = os.path.exists(f"data/{filename_prefix}_ctx{ctx_length}_train_X.txt")
 
     if dataset_exists:
@@ -410,7 +615,7 @@ if __name__ == "__main__":
             valid_X = valid_X[:max_samples]
             valid_y = valid_y[:max_samples]
 
-    # Initialize config from JSON file if provided, otherwise use defaults
+    # Initialize config from JSON file, W&B run config, or defaults.
     if args.config:
         print(f"Loading config from {args.config}")
         with open(args.config, "r") as f:
@@ -422,27 +627,20 @@ if __name__ == "__main__":
         )
         if "L" in config_dict and config_dict["L"] != ctx_length:
             raise ValueError(f"Config file has L={config_dict['L']}, but overriding with ctx_length={ctx_length}")
+    elif wandb_config_kwargs is not None:
+        print("Building config from W&B run config (no local --config provided).")
+        shakespeare_config = Config(
+            L=ctx_length,
+            vocab_size=vocab_size,
+            **wandb_config_kwargs,
+        )
     else:
         shakespeare_config = Config(
             L=ctx_length,
             vocab_size=vocab_size,
         )
 
-    effective_init_weights = args.init_weights
-    resolved_wandb_run = None
-    source_run = None
-    if args.init_wandb_run:
-        resolved_wandb_run = parse_wandb_run_ref(args.init_wandb_run)
-        print(
-            f"Downloading initialization checkpoint '{args.init_wandb_file}' from W&B run "
-            f"'{resolved_wandb_run}'..."
-        )
-        effective_init_weights, source_run = download_wandb_checkpoint(
-            run_path=resolved_wandb_run,
-            file_name=args.init_wandb_file,
-            download_root=args.init_wandb_root,
-        )
-        print(f"Downloaded checkpoint to: {effective_init_weights}")
+    if source_run is not None:
         validate_wandb_run_config_compat(source_run, shakespeare_config)
 
     # Create timestamped output directory
@@ -462,16 +660,25 @@ if __name__ == "__main__":
     config_save_dict['log_full_weights_each_epoch'] = True
     config_save_dict['eval_batch_size'] = args.eval_batch_size
     config_save_dict['train_log_every_steps'] = args.train_log_every_steps
+    config_save_dict['clear_jax_cache_every_steps'] = args.clear_jax_cache_every_steps
     config_save_dict['temperature'] = args.temperature
     config_save_dict['gen_chars'] = args.gen_chars
     if args.config:
         config_save_dict['config_file'] = args.config
+    elif source_run is not None:
+        config_save_dict['config_from_wandb_run'] = True
     if effective_init_weights:
         config_save_dict['init_weights'] = effective_init_weights
-    if args.init_wandb_run:
+    if resolved_wandb_run:
         config_save_dict['init_wandb_run'] = resolved_wandb_run
-        config_save_dict['init_wandb_file'] = args.init_wandb_file
+        config_save_dict['init_wandb_file'] = resolved_wandb_file
         config_save_dict['init_wandb_root'] = args.init_wandb_root
+        if args.init_wandb_run_id:
+            config_save_dict['init_wandb_run_id'] = args.init_wandb_run_id
+            config_save_dict['init_wandb_entity'] = args.init_wandb_entity
+            config_save_dict['init_wandb_project'] = args.init_wandb_project
+        if resolved_wandb_epoch is not None:
+            config_save_dict['init_wandb_epoch'] = resolved_wandb_epoch
     config_save_dict['curriculum_T_final'] = args.curriculum_T_final
     if args.curriculum_T_final:
         config_save_dict['curriculum_base_T_final'] = args.curriculum_base_T_final
@@ -534,6 +741,7 @@ if __name__ == "__main__":
 
     num_batches = num_train // batch_size
     total_steps = shakespeare_config.train_epochs * num_batches
+    curriculum_start_T_final = shakespeare_config.T_final
 
 
     def lr_sched(
@@ -589,7 +797,11 @@ if __name__ == "__main__":
     def make_train_step(cfg):
         def train_step(params, opt_state, train_X, train_Y, force_weight):
             loss, grads = jax.value_and_grad(loss_fn)(
-                params, train_X, train_Y, force_weight, cfg
+                params,
+                train_X,
+                train_Y,
+                force_weight,
+                cfg=cfg,
             )
             grad_norm = optax.global_norm(grads)
             updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -621,58 +833,6 @@ if __name__ == "__main__":
     seed_context_valid = valid_X[0]
 
     for epoch in range(shakespeare_config.train_epochs):
-        # Handle curriculum learning for T_final
-        if args.curriculum_T_final:
-            new_T_final = get_T_final_for_epoch(
-                epoch, 
-                base_T_final=args.curriculum_base_T_final,
-                phase_length=args.curriculum_phase_length
-            )
-            
-            if new_T_final != current_T_final:
-                # T_final changed, create new config and re-JIT train_step
-                print(f"\n=== Curriculum Update at epoch {epoch}: T_final {current_T_final:.4f} -> {new_T_final:.4f} (n_steps: {int(new_T_final / shakespeare_config.step_size)}) ===\n")
-                
-                # Create new config with updated T_final but same step_size
-                current_config = Config(
-                    L=shakespeare_config.L,
-                    vocab_size=shakespeare_config.vocab_size,
-                    D=shakespeare_config.D,
-                    M=shakespeare_config.M,
-                    beta=shakespeare_config.beta,
-                    xi_attn_embed_raw_scale=shakespeare_config.xi_attn_embed_raw_scale,
-                    xi_pos_raw_scale=shakespeare_config.xi_pos_raw_scale,
-                    xi_hopf_raw_scale=shakespeare_config.xi_hopf_raw_scale,
-                    step_size=shakespeare_config.step_size,  # Keep step_size constant
-                    T_final=new_T_final,  # Update T_final
-                    batch_size=shakespeare_config.batch_size,
-                    train_epochs=shakespeare_config.train_epochs,
-                    seed=shakespeare_config.seed,
-                    tau_v=shakespeare_config.tau_v,
-                    tau_h=shakespeare_config.tau_h,
-                    use_multi_transform=shakespeare_config.use_multi_transform,
-                    lr_init_value=shakespeare_config.lr_init_value,
-                    lr_peak_value=shakespeare_config.lr_peak_value,
-                    learning_rate=shakespeare_config.learning_rate,
-                    lr_end_factor=shakespeare_config.lr_end_factor,
-                    max_norm=shakespeare_config.max_norm,
-                    slow_weight_decay=shakespeare_config.slow_weight_decay,
-                    fast_weight_decay=shakespeare_config.fast_weight_decay,
-                    force_penalty_start=shakespeare_config.force_penalty_start,
-                    force_penalty_duration=shakespeare_config.force_penalty_duration,
-                    force_penalty_scale=shakespeare_config.force_penalty_scale,
-                )
-                
-                # Re-create the train_step with new config
-                train_step = make_train_step(current_config)
-                current_T_final = new_T_final
-                
-                # Log to W&B
-                wandb.log({
-                    "curriculum/T_final": new_T_final,
-                    "curriculum/n_steps": current_config.n_steps,
-                    "epoch": epoch,
-                }, step=global_step)
         t_start = time.time()
         key, key_perm = jr.split(key)
         index_perm = jr.permutation(key_perm, num_train)
@@ -684,6 +844,64 @@ if __name__ == "__main__":
         lam_force_value = float(lam_force)
 
         for batch in range(num_batches):
+            # Handle curriculum learning for T_final at step granularity.
+            if args.curriculum_T_final:
+                new_T_final = get_T_final_for_step(
+                    global_step,
+                    num_batches_per_epoch=num_batches,
+                    start_T_final=curriculum_start_T_final,
+                    base_T_final=args.curriculum_base_T_final,
+                    phase_length=args.curriculum_phase_length,
+                )
+                prev_T_final = current_T_final
+                current_T_final = new_T_final
+                new_n_steps = max(1, int(new_T_final / shakespeare_config.step_size))
+
+                if new_n_steps != current_config.n_steps:
+                    print(
+                        f"\n=== Curriculum Update at epoch {epoch}, step {global_step}: "
+                        f"T_final {prev_T_final:.6f} -> {new_T_final:.6f} "
+                        f"(n_steps: {current_config.n_steps} -> {new_n_steps}) ===\n"
+                    )
+                    current_config = Config(
+                        L=shakespeare_config.L,
+                        vocab_size=shakespeare_config.vocab_size,
+                        D=shakespeare_config.D,
+                        M=shakespeare_config.M,
+                        beta=shakespeare_config.beta,
+                        xi_attn_embed_raw_scale=shakespeare_config.xi_attn_embed_raw_scale,
+                        xi_pos_raw_scale=shakespeare_config.xi_pos_raw_scale,
+                        xi_hopf_raw_scale=shakespeare_config.xi_hopf_raw_scale,
+                        step_size=shakespeare_config.step_size,
+                        T_final=new_T_final,
+                        batch_size=shakespeare_config.batch_size,
+                        train_epochs=shakespeare_config.train_epochs,
+                        seed=shakespeare_config.seed,
+                        tau_v=shakespeare_config.tau_v,
+                        tau_h=shakespeare_config.tau_h,
+                        use_multi_transform=shakespeare_config.use_multi_transform,
+                        lr_init_value=shakespeare_config.lr_init_value,
+                        lr_peak_value=shakespeare_config.lr_peak_value,
+                        learning_rate=shakespeare_config.learning_rate,
+                        lr_end_factor=shakespeare_config.lr_end_factor,
+                        max_norm=shakespeare_config.max_norm,
+                        slow_weight_decay=shakespeare_config.slow_weight_decay,
+                        fast_weight_decay=shakespeare_config.fast_weight_decay,
+                        force_penalty_start=shakespeare_config.force_penalty_start,
+                        force_penalty_duration=shakespeare_config.force_penalty_duration,
+                        force_penalty_scale=shakespeare_config.force_penalty_scale,
+                    )
+                    train_step = make_train_step(current_config)
+
+                    wandb.log(
+                        {
+                            "curriculum/T_final": current_T_final,
+                            "curriculum/n_steps": current_config.n_steps,
+                            "epoch": epoch,
+                        },
+                        step=global_step,
+                    )
+
             batch_train_X = train_X_epoch[batch]
             batch_train_y = train_y_epoch[batch]
 
@@ -720,10 +938,21 @@ if __name__ == "__main__":
                     log_dict["train/lr_slow"] = float(lr_schedule_slow(global_step))
                 else:
                     log_dict["train/lr"] = float(shakespeare_config.learning_rate)
+                if args.curriculum_T_final:
+                    log_dict["curriculum/T_final"] = current_T_final
+                    log_dict["curriculum/n_steps"] = current_config.n_steps
 
                 wandb.log(log_dict, step=global_step)
 
             global_step += 1
+            if (
+                args.clear_jax_cache_every_steps > 0
+                and global_step % args.clear_jax_cache_every_steps == 0
+            ):
+                # Keep JIT cache growth bounded during long curriculum runs.
+                jax.clear_caches()
+                gc.collect()
+                print(f"Cleared JAX caches at step {global_step}")
 
         t_end = time.time()
         epoch_time = t_end - t_start
@@ -750,13 +979,23 @@ if __name__ == "__main__":
             wandb.log({**weight_snapshot, "epoch": epoch}, step=global_step - 1)
 
         if epoch % 1 == 0:
-            acc = evaluate(params, valid_X, valid_y, current_config, batch_size=args.eval_batch_size)
+            acc = evaluate(
+                params,
+                valid_X,
+                valid_y,
+                current_config,
+                batch_size=args.eval_batch_size,
+            )
             accs_all.append(float(acc))
             accs_steps.append((epoch + 1) * num_batches - 1)
             
             # Calculate perplexity
             perplexity = calculate_perplexity(
-                params, valid_X, valid_y, current_config, batch_size=args.eval_batch_size
+                params,
+                valid_X,
+                valid_y,
+                current_config,
+                batch_size=args.eval_batch_size,
             )
             perplexities_all.append(float(perplexity))
             perplexities_steps.append((epoch + 1) * num_batches - 1)
@@ -826,7 +1065,7 @@ if __name__ == "__main__":
                 ),
             }
             if args.curriculum_T_final:
-                eval_log_dict["curriculum/T_final"] = current_config.T_final
+                eval_log_dict["curriculum/T_final"] = current_T_final
                 eval_log_dict["curriculum/n_steps"] = current_config.n_steps
             wandb.log(eval_log_dict, step=global_step - 1)
             # --------------------------------

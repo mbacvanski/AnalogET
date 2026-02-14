@@ -16,17 +16,17 @@ import jax.numpy as jnp
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
-from config import Config
+from config import config
 from data import load_dataset
 from model import infer_forward_euler, logits_from_v
 from utils import ModelParams, load_params
 
 
-BETA = Config.beta
-ALPHA = Config.step_size / 10  # initial dt guess for the ODE solver
-T_FINAL = float(Config.T_final)
-TAU_V = Config.tau_v  # visible neuron time constant (arbitrary units)
-TAU_H = Config.tau_h  # hidden neuron time constant (faster relax)
+BETA = config.beta
+ALPHA = config.step_size / 10  # initial dt guess for the ODE solver
+T_FINAL = float(config.T_final)
+TAU_V = config.tau_v  # visible neuron time constant (arbitrary units)
+TAU_H = config.tau_h  # hidden neuron time constant (faster relax)
 
 
 @dataclass
@@ -219,15 +219,15 @@ def run_model_direct_inference(ctx_tokens: jnp.ndarray, params: ModelParams):
     """
     Run inference using model_direct's forward-Euler unroll on the given context.
     """
-    L = int(Config.L)
-    D = int(Config.D)
+    L = int(config.L)
+    D = int(config.D)
     if ctx_tokens.ndim != 1 or ctx_tokens.shape[0] != L:
         raise ValueError(f"ctx_tokens must have shape ({L},), got {ctx_tokens.shape}")
 
     ctx_bits = jnp.asarray(ctx_tokens, dtype=jnp.int32).reshape(1, L)
     V0 = jnp.zeros((1, D), dtype=jnp.float32)
 
-    V_T_batched, _ = infer_forward_euler(params, V0, ctx_bits)  # (1, D)
+    V_T_batched, _ = infer_forward_euler(params, V0, ctx_bits, config)  # (1, D)
     logits_batched = logits_from_v(params, V_T_batched)  # (1, C)
 
     logits = logits_batched[0]
@@ -309,7 +309,7 @@ def evaluate_model():
             "c": c,
             "W_dec": W_dec,
             "b_dec": b_dec,
-            "b": (jnp.asarray(b) if "b" in p else jnp.zeros((Config.L,))),
+            "b": (jnp.asarray(b) if "b" in p else jnp.zeros((config.L,))),
         },
     )
 
@@ -338,7 +338,7 @@ def evaluate_model():
                     "c": c,
                     "W_dec": W_dec,
                     "b_dec": b_dec,
-                    "b": (jnp.asarray(b) if "b" in p else jnp.zeros((Config.L,))),
+                    "b": (jnp.asarray(b) if "b" in p else jnp.zeros((config.L,))),
                 },
             )[0]
             for ctx_i in tqdm(test_X)

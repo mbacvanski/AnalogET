@@ -9,33 +9,33 @@ import jax.numpy as jnp
 import jax.random as jr
 import optax
 
-from config import Config
+from config import config
 from data import generate_and_save_datasets, load_dataset
 from model import evaluate, force_penalty_weight, init_params, label_tree, loss_fn
 from utils import save_metrics, save_params
 
 
 if __name__ == "__main__":
-    key = jr.PRNGKey(Config.seed)
+    key = jr.PRNGKey(config.seed)
 
     # TODO: use different key
     generate_and_save_datasets(
-        key=key, ctx_length=Config.L, train_ratio=0.8, filename_prefix="parity_data"
+        key=key, ctx_length=config.L, train_ratio=0.8, filename_prefix="parity_data"
     )
     train_X, train_y, valid_X, valid_y = load_dataset(filename_prefix="parity_data")
 
-    params = init_params(key)
+    params = init_params(key, config)
 
     num_train = train_X.shape[0]
-    num_batches = (num_train + Config.batch_size - 1) // Config.batch_size
-    total_steps = Config.train_epochs * num_batches
+    num_batches = (num_train + config.batch_size - 1) // config.batch_size
+    total_steps = config.train_epochs * num_batches
 
     def lr_sched(
         peak: float, warmup_steps: int = 0, end_factor: float = 0.3
     ) -> optax.Schedule:
         """warm up to peak, then decay to peak * end_factor"""
         return optax.warmup_cosine_decay_schedule(
-            init_value=Config.lr_init_value,
+            init_value=config.lr_init_value,
             peak_value=peak,
             warmup_steps=warmup_steps,
             decay_steps=max(1, total_steps - warmup_steps),
@@ -44,17 +44,17 @@ if __name__ == "__main__":
 
     # don't apply weight decay to xi_attn_embed_raw and xi_hopf_raw
     tx_fast = optax.chain(
-        optax.clip_by_global_norm(Config.max_norm),
+        optax.clip_by_global_norm(config.max_norm),
         optax.adamw(
-            learning_rate=lr_sched(Config.lr_peak_value),
-            weight_decay=Config.fast_weight_decay,
+            learning_rate=lr_sched(config.lr_peak_value),
+            weight_decay=config.fast_weight_decay,
         ),
     )
     tx_slow = optax.chain(
-        optax.clip_by_global_norm(Config.max_norm),
+        optax.clip_by_global_norm(config.max_norm),
         optax.adamw(
-            learning_rate=lr_sched(Config.lr_peak_value),
-            weight_decay=Config.slow_weight_decay,
+            learning_rate=lr_sched(config.lr_peak_value),
+            weight_decay=config.slow_weight_decay,
         ),
     )
 
@@ -66,7 +66,7 @@ if __name__ == "__main__":
     @jax.jit
     def train_step(params, opt_state, train_X, train_Y, force_weight):
         loss, grads = jax.value_and_grad(loss_fn)(
-            params, train_X, train_Y, force_weight
+            params, train_X, train_Y, force_weight, config
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     losses_steps: List[int] = []
     accs_all = []
     accs_steps: List[int] = []
-    for epoch in range(Config.train_epochs):
+    for epoch in range(config.train_epochs):
         t_start = time.time()
         key, key_perm = jr.split(key)
         index_perm = jr.permutation(key_perm, num_train)
@@ -86,11 +86,11 @@ if __name__ == "__main__":
         losses_epoch = []
 
         # compute current force penalty weight (cosine ramp 0 -> 1)
-        lam_force = jnp.asarray(force_penalty_weight(epoch), dtype=jnp.float32)
+        lam_force = jnp.asarray(force_penalty_weight(epoch, config), dtype=jnp.float32)
 
         for batch in range(num_batches):
-            start = batch * Config.batch_size
-            stop = min((batch + 1) * Config.batch_size, num_train)
+            start = batch * config.batch_size
+            stop = min((batch + 1) * config.batch_size, num_train)
             key, sub = jr.split(key)
             batch_train_X = train_X_epoch[start:stop]
             batch_train_y = train_y_epoch[start:stop]
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         t_end = time.time()
 
         if epoch % 100 == 0:
-            acc = evaluate(params, valid_X, valid_y)
+            acc = evaluate(params, valid_X, valid_y, config)
             accs_all.append(float(acc))
             accs_steps.append((epoch + 1) * num_batches - 1)
             print(
